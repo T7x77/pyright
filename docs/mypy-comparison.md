@@ -152,7 +152,6 @@ Pyright supports several built-in type guards that mypy does not currently suppo
 
 The following expression forms are not currently supported by mypy as type guards:
 * `x == L` and `x != L` (where L is an expression with a literal type)
-* `len(x) == L` and `len(x) != L` (where x is tuple and L is a literal integer)
 * `x in y` or `x not in y` (where y is instance of list, set, frozenset, deque, tuple, dict, defaultdict, or OrderedDict)
 * `bool(x)` (where x is any expression that is statically verifiable to be truthy or falsey in all cases)
 
@@ -160,42 +159,6 @@ The following expression forms are not currently supported by mypy as type guard
 ### Aliased Conditional Expressions
 
 Pyright supports the [aliasing of conditional expressions](type-concepts-advanced.md#aliased-conditional-expression) used for type guards. Mypy does not currently support this, but it is a frequently-requested feature.
-
-
-### Narrowing for Implied Else
-
-Pyright supports a feature called [type narrowing for implied else](type-concepts-advanced.md#narrowing-for-implied-else) in cases where an `if` or `elif` clause has no associated `else` clause. This feature allows pyright to determine that all cases have already been handled by the `if` or `elif` statement and that the "implied else" would never be executed if it were present. This eliminates certain false positive errors. Mypy currently does not support this.
-
-```python
-class Color(Enum):
-    RED = 1
-    BLUE = 2
-
-def is_red(color: Color) -> bool:
-    if color == Color.RED:
-        return True
-    elif color == Color.BLUE:
-        return False
-    # mypy reports error: Missing return statement
-```
-
-### Narrowing for Captured Variables
-
-If a variable’s type is narrowed in an outer scope and the variable is subsequently used within an inner-scoped function or lambda, mypy does not retain the narrowed type within the inner scope. Pyright retains the narrowed type if it can determine that the value of the captured variable is not modified on any code path after the inner-scope function or lambda is defined.
-
-```python
-def func(val: int | None):
-    if val is not None:
-
-        def inner_1() -> None:
-            reveal_type(val)  # pyright: int, mypy: int | None
-            print(val + 1)  # mypy produces a false positive error here
-
-        inner_2 = lambda: reveal_type(val) + 1  # pyright: int, mypy: int | None
-
-        inner_1()
-        inner_2()
-```
 
 
 ### Narrowing Any
@@ -355,47 +318,9 @@ def func2(x: list[int], y: list[str] | int):
     reveal_type(v2) # pyright: "list[int | str]" ("list[list[str] | int]" is also a valid answer)
 ```
 
-#### Constraint Solver: Higher-order Functions
+### Value-Constrained Type Variables
 
-If a generic higher-order function is passed another generic callable as an argument, pyright is able to solve the type variables for both the target function and the argument. Mypy isn’t able to handle higher-order functions.
-
-```python
-def identity(val: T) -> T:
-    return val
-
-
-def higher_order1(cb: Callable[[S], T], arg: S) -> T:
-    return cb(arg)
-
-v1 = higher_order1(identity, 1.0)  # mypy generates an error
-reveal_type(v1)  # mypy: T, pyright: float
-
-
-def higher_order2(cb: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
-    return cb(*args, **kwargs)
-
-v2 = higher_order2(identity, "")  # mypy generates an error
-reveal_type(v2)  # mypy: T, pyright: str
-```
-
-
-#### Constraint Solver: Overloads and ParamSpec
-
-If a function accepts a `Callable` parameterized with a `ParamSpec`, pyright allows you to pass an overloaded function as an argument. The constraint solver solves the type variables for each overload signature independently and then “unions” the results. Mypy uses only the first overload in this case and ignores all subsequent overloads.
-
-```python
-def wrap(func: Callable[P, T]) -> Callable[P, T]:
-    ...
-
-# 'max' is an overloaded built-in function
-max2 = wrap(max)
-reveal_type(max2) # Mypy includes only the first overload, pyright includes all
-```
-
-
-### Constrained Type Variables
-
-When mypy analyzes a class or function that has in-scope constrained TypeVars, it analyzes the class or function multiple times, once for each constraint. This can produce multiple errors.
+When mypy analyzes a class or function that has in-scope value-constrained TypeVars, it analyzes the class or function multiple times, once for each constraint. This can produce multiple errors.
 
 ```python
 T = TypeVar("T", list[Any], set[Any])
@@ -405,7 +330,7 @@ def func(a: AnyStr, b: T):
     return a + b # Mypy reports 4 errors
 ```
 
-Pyright cannot use the same multi-pass technique as mypy in this case. It needs to produce a single type for any given identifier to support language server features. Pyright instead uses a mechanism called [conditional types](type-concepts-advanced.md#conditional-types-and-type-variables). This approach allows pyright to handle some constrained TypeVar use cases that mypy cannot, but there are conversely other use cases that mypy can handle and pyright cannot.
+Pyright cannot use the same multi-pass technique as mypy in this case. It needs to produce a single type for any given identifier to support language server features. Pyright instead uses a mechanism called [conditional types](type-concepts-advanced.md#conditional-types-and-type-variables). This approach allows pyright to handle some value-constrained TypeVar use cases that mypy cannot, but there are conversely other use cases that mypy can handle and pyright cannot.
 
 
 ### “Unknown” Type and Strict Mode

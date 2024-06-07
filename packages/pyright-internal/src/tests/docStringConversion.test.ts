@@ -446,6 +446,32 @@ ${singleTick}FooBar${singleTick} is interesting.
     _testConvertToMarkdown(docstring, markdown);
 });
 
+test('CodeBlockDirective', () => {
+    const docstring = `Take a look at this 
+    .. code-block:: Python
+
+    if foo:
+        print(foo)
+    else:
+        print('not foo!')
+
+This text comes after.
+`;
+
+    const markdown = `Take a look at this
+${tripleTick}
+
+    if foo:
+        print(foo)
+    else:
+        print('not foo!')
+${tripleTick}
+
+This text comes after.`;
+
+    _testConvertToMarkdown(docstring, markdown);
+});
+
 test('UnfinishedBacktickBlock', () => {
     const docstring = '```\nsomething\n';
 
@@ -713,31 +739,6 @@ Example function with types documented in the docstring.
 Args:  
 &nbsp;&nbsp;&nbsp;&nbsp;param1 (int|bool): The first parameter.  
 &nbsp;&nbsp;&nbsp;&nbsp;param2 (list\\[str\\] with others): The second parameter.
-
-Returns:  
-&nbsp;&nbsp;&nbsp;&nbsp;bool: The return value. True for success, False otherwise.`;
-
-    _testConvertToMarkdown(docstring, markdown);
-});
-
-test('GoogleWithInvalidTypes', () => {
-    const docstring = `
-    Example function with types documented in the docstring.
-
-    Args:
-        param1: (int|bool))): The first parameter.
-        param2: (list[str] with others): The second parameter.
-
-    Returns:
-        bool: The return value. True for success, False otherwise.
-`;
-
-    const markdown = `
-Example function with types documented in the docstring.
-
-Args:  
-&nbsp;&nbsp;&nbsp;&nbsp;param1: (int|bool))): The first parameter.
-param2: (list\\[str\\] with others): The second parameter.
 
 Returns:  
 &nbsp;&nbsp;&nbsp;&nbsp;bool: The return value. True for success, False otherwise.`;

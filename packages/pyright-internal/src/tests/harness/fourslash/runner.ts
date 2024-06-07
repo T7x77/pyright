@@ -69,7 +69,7 @@ export function runFourSlashTestContent(
             : new TestState(absoluteBasePath, testData, mountPaths, hostSpecificFeatures);
     const output = ts.transpileModule(content, {
         reportDiagnostics: true,
-        compilerOptions: { target: ts.ScriptTarget.ES2015 },
+        compilerOptions: { target: ts.ScriptTarget.ES2019 },
     });
     if (output.diagnostics!.length > 0) {
         throw new Error(`Syntax error in ${absoluteBasePath}: ${output.diagnostics![0].messageText}`);
@@ -84,7 +84,7 @@ async function runCode(code: string, state: TestState, cb?: jest.DoneCallback) {
         const wrappedCode = `(async function(helper, Consts) {
 ${code}
 })`;
-        const f = eval(wrappedCode);
+        const f = eval(wrappedCode); // CodeQL [SM01632] test code that doesn't need to be secure.
         await f(state, Consts);
         markDone();
     } catch (ex) {

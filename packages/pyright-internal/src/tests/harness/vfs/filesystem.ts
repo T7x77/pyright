@@ -8,14 +8,17 @@
 
 /* eslint-disable no-dupe-class-members */
 import { Dirent, ReadStream, WriteStream } from 'fs';
-import { URI } from 'vscode-uri';
 
-import { FileSystem, MkDirOptions, TmpfileOptions } from '../../../common/fileSystem';
+import { FileSystem, MkDirOptions, TempFile, TmpfileOptions } from '../../../common/fileSystem';
+import { FileWatcher, FileWatcherEventHandler, FileWatcherEventType } from '../../../common/fileWatcher';
 import * as pathUtil from '../../../common/pathUtils';
+import { compareStringsCaseInsensitive, compareStringsCaseSensitive } from '../../../common/stringUtils';
 import { bufferFrom, createIOError } from '../utils';
 import { Metadata, SortedMap, closeIterator, getIterator, nextResult } from './../utils';
 import { ValidationFlags, validate } from './pathValidation';
-import { FileWatcher, FileWatcherEventHandler, FileWatcherEventType } from '../../../common/fileWatcher';
+import { FileUriSchema } from '../../../common/uri/fileUri';
+import { Uri } from '../../../common/uri/uri';
+import { CaseSensitivityDetector } from '../../../common/caseSensitivityDetector';
 
 export const MODULE_PATH = pathUtil.normalizeSlashes('/');
 
@@ -27,18 +30,14 @@ export interface DiffOptions {
 }
 
 export class TestFileSystemWatcher implements FileWatcher {
-    private _paths: string[] = [];
-    constructor(paths: string[], private _listener: FileWatcherEventHandler) {
-        this._paths = paths.map((p) => pathUtil.normalizePath(p));
-    }
+    constructor(private _paths: Uri[], private _listener: FileWatcherEventHandler) {}
     close() {
         // Do nothing.
     }
 
-    fireFileChange(path: string, eventType: FileWatcherEventType): boolean {
-        const normalized = pathUtil.normalizePath(path);
-        if (this._paths.some((p) => normalized.startsWith(p))) {
-            this._listener(eventType, normalized);
+    fireFileChange(path: Uri, eventType: FileWatcherEventType): boolean {
+        if (this._paths.some((p) => path.startsWith(p))) {
+            this._listener(eventType, path.getFilePath());
             return true;
         }
         return false;
@@ -48,7 +47,7 @@ export class TestFileSystemWatcher implements FileWatcher {
 /**
  * Represents a virtual POSIX-like file system.
  */
-export class TestFileSystem implements FileSystem {
+export class TestFileSystem implements FileSystem, TempFile, CaseSensitivityDetector {
     /** Indicates whether the file system is case-sensitive (`false`) or case-insensitive (`true`). */
     readonly ignoreCase: boolean;
 
@@ -75,9 +74,7 @@ export class TestFileSystem implements FileSystem {
         this._id = TestFileSystem._nextId++;
         const { time = -1, files, meta } = options;
         this.ignoreCase = ignoreCase;
-        this.stringComparer = this.ignoreCase
-            ? pathUtil.comparePathsCaseInsensitive
-            : pathUtil.comparePathsCaseSensitive;
+        this.stringComparer = this.ignoreCase ? compareStringsCaseInsensitive : compareStringsCaseSensitive;
         this._time = time;
 
         if (meta) {
@@ -243,7 +240,8 @@ export class TestFileSystem implements FileSystem {
      *
      * @link http://pubs.opengroup.org/onlinepubs/9699919799/functions/chdir.html
      */
-    chdir(path: string) {
+    chdir(uri: Uri) {
+        let path = uri.getFilePath();
         if (this.isReadonly) {
             throw createIOError('EPERM');
         }
@@ -275,7 +273,7 @@ export class TestFileSystem implements FileSystem {
             this._dirStack.push(this._cwd);
         }
         if (path && path !== this._cwd) {
-            this.chdir(path);
+            this.chdir(Uri.file(path, this));
         }
     }
 
@@ -288,7 +286,7 @@ export class TestFileSystem implements FileSystem {
         }
         const path = this._dirStack && this._dirStack.pop();
         if (path) {
-            this.chdir(path);
+            this.chdir(Uri.file(path, this));
         }
     }
 
@@ -332,7 +330,7 @@ export class TestFileSystem implements FileSystem {
         return results;
     }
 
-    createFileSystemWatcher(paths: string[], listener: FileWatcherEventHandler): FileWatcher {
+    createFileSystemWatcher(paths: Uri[], listener: FileWatcherEventHandler): FileWatcher {
         const watcher = new TestFileSystemWatcher(paths, listener);
         this._watchers.push(watcher);
         return watcher;
@@ -340,51 +338,59 @@ export class TestFileSystem implements FileSystem {
 
     fireFileWatcherEvent(path: string, event: FileWatcherEventType) {
         for (const watcher of this._watchers) {
-            if (watcher.fireFileChange(path, event)) {
+            if (watcher.fireFileChange(Uri.file(path, this), event)) {
                 break;
             }
         }
     }
 
-    getModulePath(): string {
-        return MODULE_PATH;
+    getModulePath(): Uri {
+        return Uri.file(MODULE_PATH, this);
     }
 
-    tmpdir(): string {
+    isCaseSensitive(uri: string) {
+        if (uri.startsWith(FileUriSchema)) {
+            return !this.ignoreCase;
+        }
+
+        return true;
+    }
+
+    isLocalFileSystemCaseSensitive(): boolean {
+        return !this.ignoreCase;
+    }
+
+    tmpdir(): Uri {
         this.mkdirpSync('/tmp');
-        return pathUtil.normalizeSlashes('/tmp');
+        return Uri.parse('file:///tmp', this);
     }
 
-    tmpfile(options?: TmpfileOptions): string {
+    tmpfile(options?: TmpfileOptions): Uri {
         // Use an algorithm similar to tmp's.
         const prefix = options?.prefix || 'tmp';
         const postfix = options?.prefix ? '-' + options.prefix : '';
         const name = `${prefix}-${this._tmpfileCounter++}${postfix}`;
-        const path = pathUtil.combinePaths(this.tmpdir(), name);
+        const path = this.tmpdir().combinePaths(name);
         this.writeFileSync(path, '');
         return path;
     }
 
-    realCasePath(path: string): string {
+    realCasePath(path: Uri): Uri {
         return path;
     }
 
-    isMappedFilePath(filepath: string): boolean {
+    isMappedUri(filepath: Uri): boolean {
         return false;
     }
 
     // Get original filepath if the given filepath is mapped.
-    getOriginalFilePath(mappedFilePath: string) {
+    getOriginalUri(mappedFilePath: Uri) {
         return mappedFilePath;
     }
 
     // Get mapped filepath if the given filepath is mapped.
-    getMappedFilePath(originalFilepath: string) {
+    getMappedUri(originalFilepath: Uri) {
         return originalFilepath;
-    }
-
-    getUri(path: string): string {
-        return URI.file(path).toString();
     }
 
     /**
@@ -420,12 +426,12 @@ export class TestFileSystem implements FileSystem {
         try {
             const stats = this.lstatSync(path);
             if (stats.isFile() || stats.isSymbolicLink()) {
-                this.unlinkSync(path);
+                this.unlinkSync(Uri.file(path, this));
             } else if (stats.isDirectory()) {
-                for (const file of this.readdirSync(path)) {
+                for (const file of this.readdirSync(Uri.file(path, this))) {
                     this.rimrafSync(pathUtil.combinePaths(path, file));
                 }
-                this.rmdirSync(path);
+                this.rmdirSync(Uri.file(path, this));
             }
         } catch (e: any) {
             if (e.code === 'ENOENT') {
@@ -468,7 +474,7 @@ export class TestFileSystem implements FileSystem {
                 for (let i = nextResult(iterator); i; i = nextResult(iterator)) {
                     const [name, node] = i.value;
                     const path = dirname ? pathUtil.combinePaths(dirname, name) : name;
-                    const marker = pathUtil.comparePaths(this._cwd, path, this.ignoreCase) === 0 ? '*' : ' ';
+                    const marker = this.stringComparer(this._cwd, path) === 0 ? '*' : ' ';
                     if (result) {
                         addToResult(path, '\n');
                     }
@@ -502,8 +508,11 @@ export class TestFileSystem implements FileSystem {
     /**
      * Determines whether a path exists.
      */
-    existsSync(path: string) {
-        const result = this._walk(this._resolve(path), /* noFollow */ true, () => 'stop');
+    existsSync(path: Uri) {
+        if (path.isEmpty()) {
+            return false;
+        }
+        const result = this._walk(this._resolve(path.getFilePath()), /* noFollow */ true, () => 'stop');
         return result !== undefined && result.node !== undefined;
     }
 
@@ -514,8 +523,8 @@ export class TestFileSystem implements FileSystem {
      *
      * NOTE: do not rename this method as it is intended to align with the same named export of the "fs" module.
      */
-    statSync(path: string) {
-        return this._stat(this._walk(this._resolve(path)));
+    statSync(path: Uri) {
+        return this._stat(this._walk(this._resolve(path.getFilePath())));
     }
 
     /**
@@ -558,8 +567,8 @@ export class TestFileSystem implements FileSystem {
      *
      * NOTE: do not rename this method as it is intended to align with the same named export of the "fs" module.
      */
-    readdirSync(path: string) {
-        const { node } = this._walk(this._resolve(path));
+    readdirSync(path: Uri) {
+        const { node } = this._walk(this._resolve(path.getFilePath()));
         if (!node) {
             throw createIOError('ENOENT');
         }
@@ -576,8 +585,8 @@ export class TestFileSystem implements FileSystem {
      *
      * NOTE: do not rename this method as it is intended to align with the same named export of the "fs" module.
      */
-    readdirEntriesSync(path: string): Dirent[] {
-        const { node } = this._walk(this._resolve(path));
+    readdirEntriesSync(path: Uri): Dirent[] {
+        const { node } = this._walk(this._resolve(path.getFilePath()));
         if (!node) {
             throw createIOError('ENOENT');
         }
@@ -595,17 +604,17 @@ export class TestFileSystem implements FileSystem {
      *
      * NOTE: do not rename this method as it is intended to align with the same named export of the "fs" module.
      */
-    mkdirSync(path: string, options?: MkDirOptions) {
+    mkdirSync(path: Uri, options?: MkDirOptions) {
         if (this.isReadonly) {
             throw createIOError('EROFS');
         }
 
         if (options?.recursive) {
-            this.mkdirpSync(path);
+            this.mkdirpSync(path.getFilePath());
             return;
         }
 
-        this._mkdir(this._walk(this._resolve(path), /* noFollow */ true));
+        this._mkdir(this._walk(this._resolve(path.getFilePath()), /* noFollow */ true));
     }
 
     /**
@@ -615,11 +624,11 @@ export class TestFileSystem implements FileSystem {
      *
      * NOTE: do not rename this method as it is intended to align with the same named export of the "fs" module.
      */
-    rmdirSync(path: string) {
+    rmdirSync(uri: Uri) {
         if (this.isReadonly) {
             throw createIOError('EROFS');
         }
-        path = this._resolve(path);
+        const path = this._resolve(uri.getFilePath());
 
         const { parent, links, node, basename } = this._walk(path, /* noFollow */ true);
         if (!parent) {
@@ -673,12 +682,12 @@ export class TestFileSystem implements FileSystem {
      *
      * NOTE: do not rename this method as it is intended to align with the same named export of the "fs" module.
      */
-    unlinkSync(path: string) {
+    unlinkSync(path: Uri) {
         if (this.isReadonly) {
             throw createIOError('EROFS');
         }
 
-        const { parent, links, node, basename } = this._walk(this._resolve(path), /* noFollow */ true);
+        const { parent, links, node, basename } = this._walk(this._resolve(path.getFilePath()), /* noFollow */ true);
         if (!parent) {
             throw createIOError('EPERM');
         }
@@ -787,9 +796,13 @@ export class TestFileSystem implements FileSystem {
      *
      * NOTE: do not rename this method as it is intended to align with the same named export of the "fs" module.
      */
-    realpathSync(path: string) {
-        const { realpath } = this._walk(this._resolve(path));
-        return realpath;
+    realpathSync(path: Uri) {
+        try {
+            const { realpath } = this._walk(this._resolve(path.getFilePath()));
+            return Uri.file(realpath, this);
+        } catch (e: any) {
+            return path;
+        }
     }
 
     /**
@@ -797,21 +810,21 @@ export class TestFileSystem implements FileSystem {
      *
      * NOTE: do not rename this method as it is intended to align with the same named export of the "fs" module.
      */
-    readFileSync(path: string, encoding?: null): Buffer;
+    readFileSync(path: Uri, encoding?: null): Buffer;
     /**
      * Read from a file.
      *
      * NOTE: do not rename this method as it is intended to align with the same named export of the "fs" module.
      */
-    readFileSync(path: string, encoding: BufferEncoding): string;
+    readFileSync(path: Uri, encoding: BufferEncoding): string;
     /**
      * Read from a file.
      *
      * NOTE: do not rename this method as it is intended to align with the same named export of the "fs" module.
      */
-    readFileSync(path: string, encoding?: BufferEncoding | null): string | Buffer;
-    readFileSync(path: string, encoding: BufferEncoding | null = null) {
-        const { node } = this._walk(this._resolve(path));
+    readFileSync(path: Uri, encoding?: BufferEncoding | null): string | Buffer;
+    readFileSync(path: Uri, encoding: BufferEncoding | null = null) {
+        const { node } = this._walk(this._resolve(path.getFilePath()));
         if (!node) {
             throw createIOError('ENOENT');
         }
@@ -831,12 +844,17 @@ export class TestFileSystem implements FileSystem {
      *
      * NOTE: do not rename this method as it is intended to align with the same named export of the "fs" module.
      */
-    writeFileSync(path: string, data: string | Buffer, encoding: BufferEncoding | null = null) {
+    writeFileSync(uri: Uri, data: string | Buffer, encoding: BufferEncoding | null = null) {
         if (this.isReadonly) {
             throw createIOError('EROFS');
         }
 
-        const { parent, links, node: existingNode, basename } = this._walk(this._resolve(path), /* noFollow */ false);
+        const {
+            parent,
+            links,
+            node: existingNode,
+            basename,
+        } = this._walk(this._resolve(uri.getFilePath()), /* noFollow */ false);
         if (!parent) {
             throw createIOError('EPERM');
         }
@@ -862,21 +880,21 @@ export class TestFileSystem implements FileSystem {
         node.ctimeMs = time;
     }
 
-    readFile(filePath: string): Promise<Buffer> {
-        return Promise.resolve(this.readFileSync(filePath));
+    readFile(fileUri: Uri): Promise<Buffer> {
+        return Promise.resolve(this.readFileSync(fileUri));
     }
-    readFileText(filePath: string, encoding?: BufferEncoding): Promise<string> {
-        return Promise.resolve(this.readFileSync(filePath, encoding || 'utf8'));
-    }
-
-    createReadStream(path: string): ReadStream {
-        throw new Error('Not implemented in test file system.');
-    }
-    createWriteStream(path: string): WriteStream {
-        throw new Error('Not implemented in test file system.');
+    readFileText(fileUri: Uri, encoding?: BufferEncoding): Promise<string> {
+        return Promise.resolve(this.readFileSync(fileUri, encoding || 'utf8'));
     }
 
-    copyFileSync(src: string, dst: string): void {
+    createReadStream(path: Uri): ReadStream {
+        throw new Error('Not implemented in test file system.');
+    }
+    createWriteStream(path: Uri): WriteStream {
+        throw new Error('Not implemented in test file system.');
+    }
+
+    copyFileSync(src: Uri, dst: Uri): void {
         throw new Error('Not implemented in test file system.');
     }
 
@@ -900,7 +918,7 @@ export class TestFileSystem implements FileSystem {
         return TestFileSystem._rootDiff(differences, changed, base, options) ? differences : undefined;
     }
 
-    isInZipOrEgg(path: string): boolean {
+    isInZip(path: Uri): boolean {
         return false;
     }
 
@@ -946,7 +964,7 @@ export class TestFileSystem implements FileSystem {
         }
         if (axis === 'descendants-or-self' || axis === 'descendants') {
             if (stats.isDirectory() && (!traversal.traverse || traversal.traverse(path, stats))) {
-                for (const file of this.readdirSync(path)) {
+                for (const file of this.readdirSync(Uri.file(path, this))) {
                     try {
                         const childpath = pathUtil.combinePaths(path, file);
                         const stats = this._stat(this._walk(childpath, noFollow));
@@ -1580,7 +1598,7 @@ export class TestFileSystem implements FileSystem {
                     throw new TypeError('Roots cannot be files.');
                 }
                 this.mkdirpSync(pathUtil.getDirectoryPath(path));
-                this.writeFileSync(path, value.data, value.encoding);
+                this.writeFileSync(Uri.file(path, this), value.data, value.encoding);
                 this._applyFileExtendedOptions(path, value);
             } else if (value instanceof Directory) {
                 this.mkdirpSync(path);

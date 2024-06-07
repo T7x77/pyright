@@ -18,11 +18,12 @@ import {
     FunctionType,
     FunctionTypeFlags,
     ModuleType,
-    NoneType,
+    NeverType,
     TypeVarType,
     UnboundType,
     UnknownType,
 } from '../analyzer/types';
+import { Uri } from '../common/uri/uri';
 import { ParameterCategory } from '../parser/parseNodes';
 
 function returnTypeCallback(type: FunctionType) {
@@ -45,13 +46,7 @@ test('SimpleTypes', () => {
     assert.strictEqual(printType(unboundType, PrintTypeFlags.None, returnTypeCallback), 'Unbound');
     assert.strictEqual(printType(unboundType, PrintTypeFlags.PythonSyntax, returnTypeCallback), 'Any');
 
-    const noneInstanceType = NoneType.createInstance();
-    assert.strictEqual(printType(noneInstanceType, PrintTypeFlags.None, returnTypeCallback), 'None');
-
-    const noneInstantiableType = NoneType.createType();
-    assert.strictEqual(printType(noneInstantiableType, PrintTypeFlags.None, returnTypeCallback), 'type[None]');
-
-    const moduleType = ModuleType.create('Test', '');
+    const moduleType = ModuleType.create('Test', Uri.empty());
     assert.strictEqual(printType(moduleType, PrintTypeFlags.None, returnTypeCallback), 'Module("Test")');
     assert.strictEqual(printType(moduleType, PrintTypeFlags.PythonSyntax, returnTypeCallback), 'Any');
 });
@@ -74,7 +69,7 @@ test('ClassTypes', () => {
         'A',
         '',
         '',
-        '',
+        Uri.empty(),
         ClassTypeFlags.None,
         0,
         /* declaredMetaclass*/ undefined,
@@ -95,7 +90,7 @@ test('ClassTypes', () => {
         'int',
         '',
         '',
-        '',
+        Uri.empty(),
         ClassTypeFlags.None,
         0,
         /* declaredMetaclass*/ undefined,
@@ -122,15 +117,11 @@ test('FunctionTypes', () => {
     FunctionType.addParameter(funcTypeA, {
         category: ParameterCategory.Simple,
         hasDeclaredType: true,
-        type: NoneType.createInstance(),
+        type: AnyType.create(),
         name: 'a',
     });
 
-    FunctionType.addParameter(funcTypeA, {
-        category: ParameterCategory.Simple,
-        hasDeclaredType: true,
-        type: AnyType.create(),
-    });
+    FunctionType.addPositionOnlyParameterSeparator(funcTypeA);
 
     FunctionType.addParameter(funcTypeA, {
         category: ParameterCategory.ArgsList,
@@ -146,39 +137,38 @@ test('FunctionTypes', () => {
         name: 'kwargs',
     });
 
-    funcTypeA.details.declaredReturnType = NoneType.createInstance();
+    funcTypeA.details.declaredReturnType = NeverType.createNoReturn();
 
     assert.strictEqual(
         printType(funcTypeA, PrintTypeFlags.None, returnTypeCallback),
-        '(a: None, /, *args: Any, **kwargs: Any) -> None'
+        '(a: Any, /, *args: Any, **kwargs: Any) -> NoReturn'
     );
-    assert.strictEqual(printType(funcTypeA, PrintTypeFlags.PythonSyntax, returnTypeCallback), 'Callable[..., None]');
+    assert.strictEqual(
+        printType(funcTypeA, PrintTypeFlags.PythonSyntax, returnTypeCallback),
+        'Callable[..., NoReturn]'
+    );
 
     const funcTypeB = FunctionType.createInstance('B', '', '', FunctionTypeFlags.None);
 
     FunctionType.addParameter(funcTypeB, {
         category: ParameterCategory.Simple,
         hasDeclaredType: true,
-        type: NoneType.createInstance(),
+        type: AnyType.create(),
         name: 'a',
     });
 
-    FunctionType.addParameter(funcTypeB, {
-        category: ParameterCategory.Simple,
-        hasDeclaredType: true,
-        type: NoneType.createInstance(),
-    });
+    FunctionType.addPositionOnlyParameterSeparator(funcTypeB);
 
     const paramSpecP = TypeVarType.createInstance('P');
     paramSpecP.details.isParamSpec = true;
-    funcTypeB.details.paramSpec = paramSpecP;
+    FunctionType.addParamSpecVariadics(funcTypeB, paramSpecP);
 
-    funcTypeB.details.declaredReturnType = NoneType.createInstance();
+    funcTypeB.details.declaredReturnType = NeverType.createNever();
 
-    assert.strictEqual(printType(funcTypeB, PrintTypeFlags.None, returnTypeCallback), '(a: None, /, **P) -> None');
+    assert.strictEqual(printType(funcTypeB, PrintTypeFlags.None, returnTypeCallback), '(a: Any, /, **P) -> Never');
     assert.strictEqual(
         printType(funcTypeB, PrintTypeFlags.PythonSyntax, returnTypeCallback),
-        'Callable[Concatenate[None, P], None]'
+        'Callable[Concatenate[Any, P], Never]'
     );
 
     const funcTypeC = FunctionType.createInstance('C', '', '', FunctionTypeFlags.None);
@@ -203,9 +193,9 @@ test('FunctionTypes', () => {
 
     const funcTypeD = FunctionType.createInstance('D', '', '', FunctionTypeFlags.None);
 
-    funcTypeD.details.paramSpec = paramSpecP;
-    funcTypeD.details.declaredReturnType = NoneType.createInstance();
+    funcTypeD.details.declaredReturnType = AnyType.create();
+    FunctionType.addParamSpecVariadics(funcTypeD, paramSpecP);
 
-    assert.strictEqual(printType(funcTypeD, PrintTypeFlags.None, returnTypeCallback), '(**P) -> None');
-    assert.strictEqual(printType(funcTypeD, PrintTypeFlags.PythonSyntax, returnTypeCallback), 'Callable[P, None]');
+    assert.strictEqual(printType(funcTypeD, PrintTypeFlags.None, returnTypeCallback), '(**P) -> Any');
+    assert.strictEqual(printType(funcTypeD, PrintTypeFlags.PythonSyntax, returnTypeCallback), 'Callable[P, Any]');
 });

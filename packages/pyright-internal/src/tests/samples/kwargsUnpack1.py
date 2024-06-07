@@ -2,7 +2,11 @@
 # a **kwargs parameter in a function signature.
 
 from typing import Protocol, TypedDict
-from typing_extensions import NotRequired, Required, Unpack
+from typing_extensions import (  # pyright: ignore[reportMissingModuleSource]
+    NotRequired,
+    Required,
+    Unpack,
+)
 
 
 class TD1(TypedDict):
@@ -32,7 +36,7 @@ def func1(**kwargs: Unpack[TD2]) -> None:
 reveal_type(func1, expected_text="(**kwargs: **TD2) -> None")
 
 
-def func2(v1: int, **kwargs: Unpack[TD1]) -> None:
+def func2(v3: str, **kwargs: Unpack[TD1]) -> None:
     pass
 
 
@@ -73,33 +77,27 @@ def func3():
 
 
 class TDProtocol1(Protocol):
-    def __call__(self, *, v1: int, v3: str) -> None:
-        ...
+    def __call__(self, *, v1: int, v3: str) -> None: ...
 
 
 class TDProtocol2(Protocol):
-    def __call__(self, *, v1: int, v3: str, v2: str = "") -> None:
-        ...
+    def __call__(self, *, v1: int, v3: str, v2: str = "") -> None: ...
 
 
 class TDProtocol3(Protocol):
-    def __call__(self, *, v1: int, v2: int, v3: str) -> None:
-        ...
+    def __call__(self, *, v1: int, v2: int, v3: str) -> None: ...
 
 
 class TDProtocol4(Protocol):
-    def __call__(self, *, v1: int) -> None:
-        ...
+    def __call__(self, *, v1: int) -> None: ...
 
 
 class TDProtocol5(Protocol):
-    def __call__(self, v1: int, v3: str) -> None:
-        ...
+    def __call__(self, v1: int, v3: str) -> None: ...
 
 
 class TDProtocol6(Protocol):
-    def __call__(self, **kwargs: Unpack[TD2]) -> None:
-        ...
+    def __call__(self, **kwargs: Unpack[TD2]) -> None: ...
 
 
 v1: TDProtocol1 = func1
@@ -115,3 +113,11 @@ v4: TDProtocol4 = func1
 v5: TDProtocol5 = func1
 
 v6: TDProtocol6 = func1
+
+
+def func4(v1: int, /, **kwargs: Unpack[TD2]) -> None: ...
+
+
+# This should generate an error because parameter v1 overlaps
+# with the TypedDict.
+def func5(v1: int, **kwargs: Unpack[TD2]) -> None: ...

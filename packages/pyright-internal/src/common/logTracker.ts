@@ -9,24 +9,28 @@
 import { ConsoleInterface, LogLevel } from './console';
 import { ReadOnlyFileSystem } from './fileSystem';
 import { Duration, timingStats } from './timing';
+import { Uri } from './uri/uri';
 
 // Consider an operation "long running" if it goes longer than this.
 const durationThresholdForInfoInMs = 2000;
 
-export function getPathForLogging(fs: ReadOnlyFileSystem, filepath: string) {
-    if (fs.isMappedFilePath(filepath)) {
-        return fs.getOriginalFilePath(filepath);
+export function getPathForLogging(fs: ReadOnlyFileSystem, fileUri: Uri) {
+    if (fs.isMappedUri(fileUri)) {
+        return fs.getOriginalUri(fileUri);
     }
 
-    return filepath;
+    return fileUri;
 }
 
 export class LogTracker {
-    private _dummyState = new State();
-    private _indentation = '';
-    private _previousTitles: string[] = [];
+    private readonly _dummyState = new State();
+    private readonly _previousTitles: string[] = [];
 
-    constructor(private _console: ConsoleInterface | undefined, private _prefix: string) {}
+    private _indentation = '';
+
+    constructor(private readonly _console: ConsoleInterface | undefined, readonly prefix: string) {
+        // Empty
+    }
 
     get logLevel() {
         const level = (this._console as any).level;
@@ -66,7 +70,7 @@ export class LogTracker {
             } else {
                 this._printPreviousTitles();
 
-                let output = `[${this._prefix}] ${this._indentation}${title}${state.get()} (${msDuration}ms)`;
+                let output = `[${this.prefix}] ${this._indentation}${title}${state.get()} (${msDuration}ms)`;
 
                 // Report parsing related perf info only if they occurred.
                 if (
@@ -85,7 +89,7 @@ export class LogTracker {
 
                 // If the operation took really long, log it as "info" so it is more visible.
                 if (msDuration >= durationThresholdForInfoInMs) {
-                    this._console.info(`[${this._prefix}] Long operation: ${title} (${msDuration}ms)`);
+                    this._console.info(`[${this.prefix}] Long operation: ${title} (${msDuration}ms)`);
                 }
             }
         }
@@ -100,7 +104,7 @@ export class LogTracker {
         }
 
         for (const previousTitle of this._previousTitles) {
-            this._console!.log(`[${this._prefix}] ${previousTitle}`);
+            this._console!.log(`[${this.prefix}] ${previousTitle}`);
         }
 
         this._previousTitles.length = 0;

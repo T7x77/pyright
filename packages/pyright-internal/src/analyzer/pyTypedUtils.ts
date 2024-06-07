@@ -8,26 +8,39 @@
  */
 
 import { FileSystem } from '../common/fileSystem';
-import { combinePaths, isDirectory, isFile } from '../common/pathUtils';
+import { Uri } from '../common/uri/uri';
+import { isDirectory, isFile } from '../common/uri/uriUtils';
 
 export interface PyTypedInfo {
-    pyTypedPath: string;
+    pyTypedPath: Uri;
     isPartiallyTyped: boolean;
 }
 
-const _pyTypedFileName = 'py.typed';
-
-export function getPyTypedInfo(fileSystem: FileSystem, dirPath: string): PyTypedInfo | undefined {
+//
+// Retrieves information about a py.typed file, if it exists, under the given path.
+//
+export function getPyTypedInfo(fileSystem: FileSystem, dirPath: Uri): PyTypedInfo | undefined {
     if (!fileSystem.existsSync(dirPath) || !isDirectory(fileSystem, dirPath)) {
         return undefined;
     }
 
-    let isPartiallyTyped = false;
-    const pyTypedPath = combinePaths(dirPath, _pyTypedFileName);
-
-    if (!fileSystem.existsSync(dirPath) || !isFile(fileSystem, pyTypedPath)) {
+    const pyTypedPath = dirPath.pytypedUri;
+    if (!fileSystem.existsSync(pyTypedPath) || !isFile(fileSystem, pyTypedPath)) {
         return undefined;
     }
+
+    return getPyTypedInfoForPyTypedFile(fileSystem, pyTypedPath);
+}
+
+//
+// Retrieves information about a py.typed file. The pyTypedPath provided must be a valid path.
+//
+export function getPyTypedInfoForPyTypedFile(fileSystem: FileSystem, pyTypedPath: Uri) {
+    // This function intentionally doesn't check whether the given py.typed path exists or not,
+    // as filesystem access is expensive if done repeatedly.
+    // The caller should verify the file's validity before calling this method and use a cache if possible
+    // to avoid high filesystem access costs.
+    let isPartiallyTyped = false;
 
     // Read the contents of the file as text.
     const fileStats = fileSystem.statSync(pyTypedPath);

@@ -42,12 +42,14 @@ describe('Diagnostic overrides', () => {
         for (const propName of overrideNamesInJson) {
             const p = json.properties[propName];
 
-            expect(p['$id']).toEqual(`#/properties/${propName}`);
-            expect(p['$ref']).toEqual(`#/definitions/diagnostic`);
-            expect(p.title).toBeDefined();
-            expect(p.title.length).toBeGreaterThan(0);
-            expect(p.default).toBeDefined();
-            expect(enumValues).toContain(p.default);
+            const ref = p['$ref'];
+            const def = json.definitions[ref.substring(ref.lastIndexOf('/') + 1)];
+
+            expect(def['$ref']).toEqual(`#/definitions/diagnostic`);
+            expect(def.title).toBeDefined();
+            expect(def.title.length).toBeGreaterThan(0);
+            expect(def.default).toBeDefined();
+            expect(enumValues).toContain(def.default);
         }
 
         const overrideNamesInCode: string[] = Object.values(DiagnosticRule).filter((x) => x.startsWith('report'));
@@ -75,19 +77,21 @@ describe('Diagnostic overrides', () => {
         for (const propName of overrideNamesInJson) {
             const p = props[propName];
 
-            expect(p.type).toEqual('string');
+            expect(p.type).toEqual(['string', 'boolean']);
             expect(p.description).toBeDefined();
             expect(p.description.length).toBeGreaterThan(0);
             expect(p.default).toBeDefined();
 
             expect(p.enum).toBeDefined();
             expect(Array.isArray(p.enum));
-            expect(p.enum).toHaveLength(4);
+            expect(p.enum).toHaveLength(6);
 
             expect(p.enum[0]).toEqual('none');
             expect(p.enum[1]).toEqual('information');
             expect(p.enum[2]).toEqual('warning');
             expect(p.enum[3]).toEqual('error');
+            expect(p.enum[4]).toEqual(true);
+            expect(p.enum[5]).toEqual(false);
 
             expect(p.enum).toContain(p.default);
         }

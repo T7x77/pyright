@@ -11,6 +11,7 @@
 
 import { TaskListToken } from './diagnostic';
 import { PythonVersion } from './pythonVersion';
+import { Uri } from './uri/uri';
 
 export const enum DiagnosticSeverityOverrides {
     Error = 'error',
@@ -38,7 +39,13 @@ export class CommandLineOptions {
     // A list of file specs to include in the analysis. Can contain
     // directories, in which case all "*.py" files within those directories
     // are included.
-    fileSpecs: string[] = [];
+    includeFileSpecs: string[] = [];
+
+    // If specified, this list of file specs overrides the includeFileSpecs
+    // above, rendering it as ignored. This is used
+    // for the CLI "--files" option, which should always override the "include"
+    // and "exclude" config file settings.
+    includeFileSpecsOverride?: string[];
 
     // A list of file specs to exclude in the analysis. Can contain
     // directories, in which case all "*.py" files within those directories
@@ -68,6 +75,9 @@ export class CommandLineOptions {
     // Path to python interpreter.
     pythonPath?: string | undefined;
 
+    // Name for the virtual environment.
+    pythonEnvironmentName?: string | undefined;
+
     // Python platform indicator (darwin, linux, win32)
     pythonPlatform?: 'Darwin' | 'Linux' | 'Windows' | undefined;
 
@@ -81,7 +91,7 @@ export class CommandLineOptions {
     stubPath?: string | undefined;
 
     // Absolute execution root (current working directory).
-    executionRoot: string;
+    executionRoot: string | Uri | undefined;
 
     // Type stub import target (for creation of type stubs).
     typeStubTargetImportName?: string | undefined;
@@ -106,7 +116,7 @@ export class CommandLineOptions {
     extraPaths?: string[] | undefined;
 
     // Default type-checking rule set. Should be one of 'off',
-    // 'basic', or 'strict'.
+    // 'basic', 'standard', or 'strict'.
     typeCheckingMode?: string | undefined;
 
     // Indicates that the settings came from VS Code rather than
@@ -138,7 +148,10 @@ export class CommandLineOptions {
     // Analyze functions and methods that have no type annotations?
     analyzeUnannotatedFunctions?: boolean;
 
-    constructor(executionRoot: string, fromVsCodeExtension: boolean) {
+    // Disable reporting of hint diagnostics with tags?
+    disableTaggedHints?: boolean;
+
+    constructor(executionRoot: string | Uri | undefined, fromVsCodeExtension: boolean) {
         this.executionRoot = executionRoot;
         this.fromVsCodeExtension = fromVsCodeExtension;
     }

@@ -13,6 +13,7 @@ import { ConsoleInterface, ConsoleWithLogLevel, LogLevel } from '../common/conso
 import { test_setDebugMode } from '../common/core';
 import { timingStats } from '../common/timing';
 import * as TestUtils from './testUtils';
+import { Uri } from '../common/uri/uri';
 
 class TestConsole implements ConsoleInterface {
     errors: string[] = [];
@@ -44,7 +45,7 @@ class TestConsole implements ConsoleInterface {
 describe('TypeEvaluatorWithTracker tests', () => {
     const consoleInterface = new TestConsole();
     const console = new ConsoleWithLogLevel(consoleInterface);
-    const config = new ConfigOptions('.');
+    const config = new ConfigOptions(Uri.empty());
 
     beforeEach(() => {
         consoleInterface.clear();
@@ -59,10 +60,6 @@ describe('TypeEvaluatorWithTracker tests', () => {
 
         TestUtils.typeAnalyzeSampleFiles(['badToken1.py'], config, console);
         assert.ok(consoleInterface.logs.length > 10, `No calls logged`);
-        assert.ok(
-            consoleInterface.logs.some((s) => s.includes('evaluateTypesForStatement')),
-            `Inner evaluateTypesForStatement not found`
-        );
     });
 
     test('Log not generated when level is error', () => {

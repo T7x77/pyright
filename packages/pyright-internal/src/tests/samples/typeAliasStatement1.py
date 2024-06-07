@@ -1,15 +1,17 @@
 # This sample tests error cases associated with the "type" statement
 # introduced in PEP 695.
 
-from typing import Callable
+from typing import Any, Callable
 
 
 T1 = 0
 
 type TA1[T1] = int
 
+
 class ClassA[T2]:
-    type TA2 = int; type TA3 = str
+    type TA2 = int
+    type TA3 = str
 
     type TA4 = int
 
@@ -38,6 +40,7 @@ else:
 def func1() -> type[int]:
     ...
 
+
 # This should generate an error because a call expression is not
 # allowed in a type alias definition.
 type TA8 = func1()
@@ -46,3 +49,40 @@ type TA8 = func1()
 # allowed in a type alias definition.
 type TA9 = (int, str, str)[0]
 
+
+type TA10 = int
+
+# This should generate an error.
+TA10.bit_count(1)
+
+# This should generate an error.
+TA10(0)
+
+list[TA10]()
+
+
+# This should generate an error.
+class DerivedInt(TA10):
+    pass
+
+
+def func2(x: object):
+    # This should generate two errors.
+    if isinstance(x, TA10):
+        reveal_type(x)
+
+
+type TA11 = Callable[..., Any]
+
+
+def func3(cb: TA11):
+    cb()
+
+
+def func4():
+    # This should generate an error.
+    type TA12 = int
+
+
+type TA12[T] = "list[T]"
+ta12: TA12[int] = [1, 2, 3]

@@ -12,23 +12,24 @@ import { CancellationToken, DocumentHighlight, DocumentHighlightKind } from 'vsc
 
 import * as ParseTreeUtils from '../analyzer/parseTreeUtils';
 import { throwIfCancellationRequested } from '../common/cancellationUtils';
-import { ProgramView } from '../common/extensibility';
+import { ProgramView, ReferenceUseCase } from '../common/extensibility';
 import { convertOffsetsToRange, convertPositionToOffset } from '../common/positionUtils';
 import { Position, TextRange } from '../common/textRange';
+import { Uri } from '../common/uri/uri';
 import { ParseNodeType } from '../parser/parseNodes';
-import { ParseResults } from '../parser/parser';
+import { ParseFileResults } from '../parser/parser';
 import { DocumentSymbolCollector } from './documentSymbolCollector';
 
 export class DocumentHighlightProvider {
-    private readonly _parseResults: ParseResults | undefined;
+    private readonly _parseResults: ParseFileResults | undefined;
 
     constructor(
         private _program: ProgramView,
-        private _filePath: string,
+        private _fileUri: Uri,
         private _position: Position,
         private _token: CancellationToken
     ) {
-        this._parseResults = this._program.getParseResults(this._filePath);
+        this._parseResults = this._program.getParseResults(this._fileUri);
     }
 
     getDocumentHighlight(): DocumentHighlight[] | undefined {
@@ -42,7 +43,7 @@ export class DocumentHighlightProvider {
             return undefined;
         }
 
-        const node = ParseTreeUtils.findNodeByOffset(this._parseResults.parseTree, offset);
+        const node = ParseTreeUtils.findNodeByOffset(this._parseResults.parserOutput.parseTree, offset);
         if (node === undefined) {
             return undefined;
         }
@@ -55,8 +56,11 @@ export class DocumentHighlightProvider {
             this._program,
             node,
             this._token,
-            this._parseResults.parseTree,
-            /* treatModuleInImportAndFromImportSame */ true
+            this._parseResults.parserOutput.parseTree,
+            {
+                treatModuleInImportAndFromImportSame: true,
+                useCase: ReferenceUseCase.References,
+            }
         );
 
         const lines = this._parseResults.tokenizerOutput.lines;

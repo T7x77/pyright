@@ -2,7 +2,7 @@
 # described in PEP 634) that contain mapping patterns.
 
 from typing import Literal, TypedDict
-from typing_extensions import NotRequired
+from typing_extensions import NotRequired  # pyright: ignore[reportMissingModuleSource]
 
 
 def test_unknown(value_to_match):
@@ -11,6 +11,14 @@ def test_unknown(value_to_match):
             reveal_type(a1, expected_text="Unknown")
             reveal_type(a2, expected_text="dict[Unknown, Unknown]")
             reveal_type(value_to_match, expected_text="Unknown")
+
+
+def test_object(value_to_match: object):
+    match value_to_match:
+        case {"hello": a1, **a2}:
+            reveal_type(a1, expected_text="Unknown")
+            reveal_type(a2, expected_text="dict[Unknown, Unknown]")
+            reveal_type(value_to_match, expected_text="object")
 
 
 def test_dict(value_to_match: dict[str | int, str | int]):

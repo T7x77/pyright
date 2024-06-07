@@ -13,37 +13,47 @@ import { BackgroundAnalysisBase, BackgroundAnalysisRunnerBase } from './backgrou
 import { InitializationData } from './backgroundThreadBase';
 import { getCancellationFolderName } from './common/cancellationUtils';
 import { ConfigOptions } from './common/configOptions';
-import { ConsoleInterface } from './common/console';
-import { FileSystem } from './common/fileSystem';
 import { FullAccessHost } from './common/fullAccessHost';
 import { Host } from './common/host';
+import { ServiceProvider } from './common/serviceProvider';
+import { getRootUri } from './common/uri/uriUtils';
 
 export class BackgroundAnalysis extends BackgroundAnalysisBase {
-    constructor(console: ConsoleInterface) {
-        super(console);
+    private static _workerIndex = 0;
+
+    constructor(serviceProvider: ServiceProvider) {
+        super(serviceProvider.console());
 
         const initialData: InitializationData = {
-            rootDirectory: (global as any).__rootDirectory as string,
+            rootUri: getRootUri(serviceProvider)?.toString() ?? '',
             cancellationFolderName: getCancellationFolderName(),
             runner: undefined,
+            workerIndex: ++BackgroundAnalysis._workerIndex,
         };
 
         // this will load this same file in BG thread and start listener
         const worker = new Worker(__filename, { workerData: initialData });
         this.setup(worker);
+
+        // Tell the cacheManager we have a worker that needs to share data.
+        serviceProvider.cacheManager()?.addWorker(initialData.workerIndex, worker);
     }
 }
 
 export class BackgroundAnalysisRunner extends BackgroundAnalysisRunnerBase {
-    constructor() {
-        super();
+    constructor(serviceProvider: ServiceProvider) {
+        super(serviceProvider);
     }
 
     protected override createHost(): Host {
-        return new FullAccessHost(this.fs);
+        return new FullAccessHost(this.getServiceProvider());
     }
 
-    protected override createImportResolver(fs: FileSystem, options: ConfigOptions, host: Host): ImportResolver {
-        return new ImportResolver(fs, options, host);
+    protected override createImportResolver(
+        serviceProvider: ServiceProvider,
+        options: ConfigOptions,
+        host: Host
+    ): ImportResolver {
+        return new ImportResolver(serviceProvider, options, host);
     }
 }

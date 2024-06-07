@@ -1,10 +1,19 @@
 # This sample tests the case where a TypeVar default refers to another
 # TypeVar in a class declaration. This sample uses PEP 695 syntax.
 
-from typing import Unpack
+from typing import Self, Unpack
 
 
-class ClassA[T1=str, T2=T1](dict[T1, T2]): ...
+class ClassA[T1=str, T2=T1](dict[T1, T2]):
+    def method1(self) -> Self:
+        return self
+
+reveal_type(
+    ClassA[int].method1, expected_text="(self: ClassA[int, int]) -> ClassA[int, int]"
+)
+reveal_type(
+    ClassA.method1, expected_text="(self: ClassA[str, str]) -> ClassA[str, str]"
+)
 
 a1 = ClassA[int]()
 reveal_type(a1, expected_text="ClassA[int, int]")
@@ -53,16 +62,16 @@ class ClassK[T1=str]:
 class ClassPA[**P1, **P2=P1, **P3=P2]: ...
 
 pa1 = ClassPA()
-reveal_type(pa1, expected_text="ClassPA[(...), (...), (...)]")
+reveal_type(pa1, expected_text="ClassPA[..., ..., ...]")
 
 pa2 = ClassPA[[str]]()
 reveal_type(pa2, expected_text="ClassPA[(str), (str), (str)]")
 
 pa3 = ClassPA[..., [float]]()
-reveal_type(pa3, expected_text="ClassPA[(...), (float), (float)]")
+reveal_type(pa3, expected_text="ClassPA[..., (float), (float)]")
 
 pa4 = ClassPA[..., [int, int], [float]]()
-reveal_type(pa4, expected_text="ClassPA[(...), (int, int), (float)]")
+reveal_type(pa4, expected_text="ClassPA[..., (int, int), (float)]")
 
 
 # This should generate an error because P1 depends on P2.
@@ -77,7 +86,7 @@ pc2 = ClassPC[float]()
 reveal_type(pc2, expected_text="ClassPC[float, (int, float)]")
 
 pc3 = ClassPC[float, ...]()
-reveal_type(pc3, expected_text="ClassPC[float, (...)]")
+reveal_type(pc3, expected_text="ClassPC[float, ...]")
 
 
 # This should generate an error because P4 depends on T1.
@@ -99,6 +108,7 @@ ta4 = ClassTA[int, float, *tuple[None, ...]]()
 reveal_type(ta4, expected_text="ClassTA[int, float, *tuple[None, ...]]")
 
 # This should generate an error because Ts1 depends on T2.
+# It will generate a second error because T2 follows a TypeVarTuple.
 class ClassTB[T1=str, *Ts1=Unpack[tuple[T1, T2]], T2=T1]: ...
 
 class ClassTC[T1=str, *Ts2=Unpack[tuple[T1, ...]]]: ...

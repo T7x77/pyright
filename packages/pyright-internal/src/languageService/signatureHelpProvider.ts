@@ -22,28 +22,27 @@ import {
 
 import { convertDocStringToMarkdown, convertDocStringToPlainText } from '../analyzer/docStringConversion';
 import { extractParameterDocumentation } from '../analyzer/docStringUtils';
-import { isTypedKwargs } from '../analyzer/parameterUtils';
 import * as ParseTreeUtils from '../analyzer/parseTreeUtils';
 import { getCallNodeAndActiveParameterIndex } from '../analyzer/parseTreeUtils';
 import { SourceMapper } from '../analyzer/sourceMapper';
 import { CallSignature, TypeEvaluator } from '../analyzer/typeEvaluatorTypes';
 import { PrintTypeFlags } from '../analyzer/typePrinter';
-import { isClassInstance } from '../analyzer/types';
 import { throwIfCancellationRequested } from '../common/cancellationUtils';
 import { ProgramView } from '../common/extensibility';
 import { convertPositionToOffset } from '../common/positionUtils';
 import { Position } from '../common/textRange';
+import { Uri } from '../common/uri/uri';
 import { CallNode, NameNode, ParseNodeType } from '../parser/parseNodes';
-import { ParseResults } from '../parser/parser';
+import { ParseFileResults } from '../parser/parser';
 import { getDocumentationPartsForTypeAndDecl, getFunctionDocStringFromType } from './tooltipUtils';
 
 export class SignatureHelpProvider {
-    private readonly _parseResults: ParseResults | undefined;
+    private readonly _parseResults: ParseFileResults | undefined;
     private readonly _sourceMapper: SourceMapper;
 
     constructor(
         private _program: ProgramView,
-        private _filePath: string,
+        private _fileUri: Uri,
         private _position: Position,
         private _format: MarkupKind,
         private _hasSignatureLabelOffsetCapability: boolean,
@@ -51,8 +50,8 @@ export class SignatureHelpProvider {
         private _context: SignatureHelpContext | undefined,
         private _token: CancellationToken
     ) {
-        this._parseResults = this._program.getParseResults(this._filePath);
-        this._sourceMapper = this._program.getSourceMapper(this._filePath, this._token, /* mapCompiled */ true);
+        this._parseResults = this._program.getParseResults(this._fileUri);
+        this._sourceMapper = this._program.getSourceMapper(this._fileUri, this._token, /* mapCompiled */ true);
     }
 
     getSignatureHelp(): SignatureHelp | undefined {
@@ -74,7 +73,7 @@ export class SignatureHelpProvider {
             return undefined;
         }
 
-        let node = ParseTreeUtils.findNodeByOffset(this._parseResults.parseTree, offset);
+        let node = ParseTreeUtils.findNodeByOffset(this._parseResults.parserOutput.parseTree, offset);
 
         // See if we can get to a "better" node by backing up a few columns.
         // A "better" node is defined as one that's deeper than the current
@@ -91,7 +90,7 @@ export class SignatureHelpProvider {
             if (ch === ',' || ch === '(') {
                 break;
             }
-            const curNode = ParseTreeUtils.findNodeByOffset(this._parseResults.parseTree, curOffset);
+            const curNode = ParseTreeUtils.findNodeByOffset(this._parseResults.parserOutput.parseTree, curOffset);
             if (curNode && curNode !== initialNode) {
                 if (ParseTreeUtils.getNodeDepth(curNode) > initialDepth) {
                     node = curNode;
@@ -185,7 +184,7 @@ export class SignatureHelpProvider {
                 const sig = signatures[prevActiveSignature];
                 if (isActive(sig)) {
                     activeSignature = prevActiveSignature;
-                    activeParameter = sig.activeParameter;
+                    activeParameter = sig.activeParameter ?? undefined;
                 }
             }
         }
@@ -236,21 +235,6 @@ export class SignatureHelpProvider {
                 paramName = params[paramIndex].name || '';
             } else if (params.length > 0) {
                 paramName = params[params.length - 1].name || '';
-            }
-
-            // If we have a typedKwargs, the param name will be wrong.
-            const kwargsIndex = paramIndex >= params.length ? params.length - 1 : paramIndex;
-            if (kwargsIndex >= 0) {
-                const kwargsParam = params[kwargsIndex];
-                if (
-                    isTypedKwargs(kwargsParam) &&
-                    isClassInstance(kwargsParam.type) &&
-                    kwargsParam.type.details.typedDictEntries
-                ) {
-                    // Use the relative position in typed dict entries.
-                    const dictIndex = paramIndex - kwargsIndex;
-                    paramName = Array.from(kwargsParam.type.details.typedDictEntries.keys())[dictIndex];
-                }
             }
 
             parameters.push({

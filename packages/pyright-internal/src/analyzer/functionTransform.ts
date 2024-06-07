@@ -9,9 +9,8 @@
  */
 
 import { DiagnosticRule } from '../common/diagnosticRules';
-import { Localizer } from '../localization/localize';
+import { LocMessage } from '../localization/localize';
 import { ExpressionNode, ParameterCategory } from '../parser/parseNodes';
-import { getFileInfo } from './analyzerNodeInfo';
 import { Symbol, SymbolFlags } from './symbol';
 import { FunctionArgument, FunctionResult, TypeEvaluator } from './typeEvaluatorTypes';
 import {
@@ -24,7 +23,7 @@ import {
     OverloadedFunctionType,
     Type,
 } from './types';
-import { ClassMember, ClassMemberLookupFlags, lookUpObjectMember, synthesizeTypeVarForSelfCls } from './typeUtils';
+import { ClassMember, lookUpObjectMember, MemberAccessFlags, synthesizeTypeVarForSelfCls } from './typeUtils';
 
 export function applyFunctionTransform(
     evaluator: TypeEvaluator,
@@ -65,7 +64,7 @@ function applyTotalOrderingTransform(
     // Verify that the class has at least one of the required functions.
     let firstMemberFound: ClassMember | undefined;
     const missingMethods = orderingMethods.filter((methodName) => {
-        const memberInfo = lookUpObjectMember(instanceType, methodName, ClassMemberLookupFlags.SkipInstanceVariables);
+        const memberInfo = lookUpObjectMember(instanceType, methodName, MemberAccessFlags.SkipInstanceMembers);
         if (memberInfo && !firstMemberFound) {
             firstMemberFound = memberInfo;
         }
@@ -74,9 +73,8 @@ function applyTotalOrderingTransform(
 
     if (!firstMemberFound) {
         evaluator.addDiagnostic(
-            getFileInfo(errorNode).diagnosticRuleSet.reportGeneralTypeIssues,
             DiagnosticRule.reportGeneralTypeIssues,
-            Localizer.Diagnostic.totalOrderingMissingMethod(),
+            LocMessage.totalOrderingMissingMethod(),
             errorNode
         );
         return result;
@@ -130,7 +128,10 @@ function applyTotalOrderingTransform(
         FunctionType.addParameter(methodToAdd, objParam);
         methodToAdd.details.declaredReturnType = boolType;
 
-        classType.details.fields.set(methodName, Symbol.createWithType(SymbolFlags.ClassMember, methodToAdd));
+        ClassType.getSymbolTable(classType).set(
+            methodName,
+            Symbol.createWithType(SymbolFlags.ClassMember, methodToAdd)
+        );
     });
 
     return result;

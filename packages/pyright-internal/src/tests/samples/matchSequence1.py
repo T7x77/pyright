@@ -1,10 +1,14 @@
 # This sample tests type checking for match statements (as
 # described in PEP 634) that contain sequence patterns.
 
+from enum import Enum
 from typing import Any, Generic, Iterator, List, Literal, Protocol, Reversible, Sequence, Tuple, TypeVar, Union
+from typing_extensions import Unpack # pyright: ignore[reportMissingModuleSource]
 
 def test_unknown(value_to_match):
     match value_to_match:
+        case []:
+            reveal_type(value_to_match, expected_text="Sequence[Unknown]")
         case a1, a2:
             reveal_type(a1, expected_text="Unknown")
             reveal_type(a2, expected_text="Unknown")
@@ -34,6 +38,8 @@ def test_unknown(value_to_match):
 
 def test_any(value_to_match: Any):
     match value_to_match:
+        case []:
+            reveal_type(value_to_match, expected_text="Sequence[Any]")
         case [*a1]:
             reveal_type(a1, expected_text="list[Any]")
         case b1:
@@ -195,7 +201,7 @@ def test_union(value_to_match: Union[Tuple[complex, complex], Tuple[int, str, fl
 
         case d1, *d2, d3 if value_to_match[0] == 0:
             reveal_type(d1, expected_text="complex | int | str | float | Any")
-            reveal_type(d2, expected_text="list[str | float] | list[str] | list[float] | list[Any]")
+            reveal_type(d2, expected_text="list[Any] | list[str | float] | list[str] | list[float]")
             reveal_type(d3, expected_text="complex | str | float | Any")
             reveal_type(value_to_match, expected_text="Tuple[complex, complex] | Tuple[int, str, float, complex] | List[str] | Tuple[float, ...] | Sequence[Any]")
         
@@ -361,7 +367,7 @@ def test_negative_narrowing1(subj: tuple[Literal[0]] | tuple[Literal[1]]):
     match subj:
         case (1,*a) | (*a):
             reveal_type(subj, expected_text="tuple[Literal[1]] | tuple[Literal[0]]")
-            reveal_type(a, expected_text="list[int]")
+            reveal_type(a, expected_text="list[Any] | list[int]")
 
         case b:
             reveal_type(subj, expected_text="Never")
@@ -423,3 +429,69 @@ def test_negative_narrowing6(a: str | None, b: str | None):
             reveal_type(x, expected_text="tuple[None, str | None]")
         case (a, b) as x:
             reveal_type(x, expected_text="tuple[str | None, str | None]")
+
+
+def test_negative_narrowing7(a: tuple[str, str] | str):
+    match a:
+        case (_, _):
+            reveal_type(a, expected_text="tuple[str, str]")
+        case _:
+            reveal_type(a, expected_text="str")
+
+
+class MyEnum(Enum):
+    A = 1
+    B = 2
+    C = 3
+
+
+def test_tuple_with_subpattern(
+    subj: Literal[MyEnum.A]
+    | tuple[Literal[MyEnum.B], int]
+    | tuple[Literal[MyEnum.C], str]
+):
+    match subj:
+        case MyEnum.A:
+            reveal_type(subj, expected_text="Literal[MyEnum.A]")
+        case (MyEnum.B, a):
+            reveal_type(subj, expected_text="tuple[Literal[MyEnum.B], int]")
+            reveal_type(a, expected_text="int")
+        case (MyEnum.C, b):
+            reveal_type(subj, expected_text="tuple[Literal[MyEnum.C], str]")
+            reveal_type(b, expected_text="str")
+
+
+def test_unbounded_tuple(
+    subj: tuple[int] | tuple[str, str] | tuple[int, Unpack[tuple[str, ...]], complex]
+):
+    match subj:
+        case (x,):
+            reveal_type(subj, expected_text="tuple[int]")
+            reveal_type(x, expected_text="int")
+
+        case (x, y):
+            reveal_type(subj, expected_text="tuple[str, str] | tuple[int, complex]")
+            reveal_type(x, expected_text="str | int")
+            reveal_type(y, expected_text="str | complex")
+
+        case (x, y, z):
+            reveal_type(subj, expected_text="tuple[int, str, complex]")
+            reveal_type(x, expected_text="int")
+            reveal_type(y, expected_text="str")
+            reveal_type(z, expected_text="complex")
+
+
+def test_unbounded_tuple_2(subj: tuple[int, str, Unpack[tuple[range, ...]]]) -> None:
+    match subj:
+        case [1, *ts1]:
+            reveal_type(ts1, expected_text="list[str | range]")
+
+        case [1, "", *ts2]:
+            reveal_type(ts2, expected_text="list[range]")
+
+def test_unbounded_tuple_3(subj: tuple[int, ...]):
+    match subj:
+        case []:
+            return
+        case x:
+            reveal_type(x, expected_text="tuple[int, ...]")

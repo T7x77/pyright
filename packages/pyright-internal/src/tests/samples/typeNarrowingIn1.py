@@ -1,19 +1,16 @@
 # This sample tests type narrowing for the "in" operator.
 
-from typing import Literal
+from typing import Callable, Generic, Literal, ParamSpec, TypeVar, TypedDict
 import random
 
 
-def verify_str(p: str) -> None:
-    ...
+def verify_str(p: str) -> None: ...
 
 
-def verify_int(p: int) -> None:
-    ...
+def verify_int(p: int) -> None: ...
 
 
-def verify_none(p: None) -> None:
-    ...
+def verify_none(p: None) -> None: ...
 
 
 x: str | None
@@ -138,3 +135,42 @@ def func10(x: Literal["A", "B"], y: tuple[Literal["A"], ...]):
         reveal_type(x, expected_text="Literal['A']")
     else:
         reveal_type(x, expected_text="Literal['A', 'B']")
+
+
+class TD1(TypedDict):
+    x: str
+
+
+class TD2(TypedDict):
+    y: str
+
+
+def func11(x: dict[str, str]):
+    if x in (TD1(x="a"), TD2(y="b")):
+        reveal_type(x, expected_text="TD1 | TD2")
+    else:
+        reveal_type(x, expected_text="dict[str, str]")
+
+
+T1 = TypeVar("T1", TD1, TD2)
+
+
+def func12(v: T1):
+    if "x" in v:
+        reveal_type(v, expected_text="TD1*")
+    else:
+        reveal_type(v, expected_text="TD2*")
+
+
+P = ParamSpec("P")
+
+
+class Container(Generic[P]):
+    def __init__(self, func: Callable[P, str]) -> None:
+        self.func = func
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> str:
+        if "data" in kwargs:
+            raise ValueError("data is not allowed in kwargs")
+
+        return self.func(*args, **kwargs)

@@ -1,8 +1,11 @@
 # This sample tests the synthesized methods get, setdefault
 # pop, __delitem__, clear, and popitem for a TypedDict.
 
-from typing import TypedDict, Union, final
-from typing_extensions import NotRequired, Required
+from typing import TypedDict, final
+from typing_extensions import (  # pyright: ignore[reportMissingModuleSource]
+    NotRequired,
+    Required,
+)
 
 
 class TD1(TypedDict):
@@ -20,7 +23,7 @@ v1: str | None = td1.get("bar")
 
 v2: str = td1.get("bar", "")
 
-v3: Union[str, int] = td1.get("bar", 3)
+v3: str | int = td1.get("bar", 3)
 
 v4: str = td1.setdefault("bar", "1")
 
@@ -34,10 +37,10 @@ td1.setdefault("bar")
 td1.setdefault("baz", "")
 
 v6: str = td1.pop("bar")
-v7: str = td1.pop("bar", "none")
-v8: Union[str, int] = td1.pop("bar", 3)
+v7: str | int = td1.pop("bar", 1)
+v8: str | int = td1.pop("bar", 3)
 
-# This should generate an error.
+# This should generate two errors.
 v9: str = td2.pop("foo")
 
 td1.__delitem__("bar")
@@ -53,7 +56,7 @@ class TD4(TypedDict):
     bar: str
 
 
-C = Union[TD3, TD4]
+C = TD3 | TD4
 
 
 def func1(a: TD3, b: TD4, c: C, s: str) -> int | None:
@@ -62,7 +65,7 @@ def func1(a: TD3, b: TD4, c: C, s: str) -> int | None:
     a2 = a.get("foo", 1.0)
     reveal_type(a2, expected_text="int")
     a3 = a.get("bar")
-    reveal_type(a3, expected_text="None")
+    reveal_type(a3, expected_text="Any | None")
     a4 = a.get("bar", 1.0)
     reveal_type(a4, expected_text="Any | float")
     a5 = a.get("baz")
@@ -92,40 +95,13 @@ def func1(a: TD3, b: TD4, c: C, s: str) -> int | None:
     c2 = c.get("foo", 1.0)
     reveal_type(c2, expected_text="int | Any | float")
     c3 = c.get("bar")
-    reveal_type(c3, expected_text="str | None")
+    reveal_type(c3, expected_text="Any | str | None")
     c4 = c.get("bar", 1.0)
     reveal_type(c4, expected_text="Any | float | str")
     c5 = c.get("baz")
     reveal_type(c5, expected_text="int | Any | None")
     c6 = c.get("baz", 1.0)
     reveal_type(c6, expected_text="int | float | Any")
-
-
-@final
-class TD5(TypedDict, total=False):
-    a: int
-
-
-@final
-class TD6(TypedDict):
-    a: NotRequired[int]
-    b: Required[int]
-
-
-td5: TD5 = {"a": 1}
-
-reveal_type(td5.clear, expected_text="() -> None")
-reveal_type(td5.popitem, expected_text="() -> tuple[str, Unknown]")
-td5.clear()
-td5.popitem()
-
-td6: TD6 = {"b": 1}
-
-# This should generate an error because not all elements are NotRequired.
-td6.clear()
-
-# This should generate an error because not all elements are NotRequired.
-td6.popitem()
 
 
 class TD7(TypedDict, total=False):

@@ -10,6 +10,7 @@
  */
 
 import * as lsp from 'vscode-languageserver';
+import { indexValueDetail } from '../../../languageService/completionProvider';
 
 /* eslint-disable @typescript-eslint/no-unused-vars */
 export namespace Consts {
@@ -22,9 +23,10 @@ export namespace Consts {
         createTypeStub = 'pyright.createtypestub',
         restartServer = 'pyright.restartserver',
         orderImports = 'pyright.organizeimports',
-        addMissingOptionalToParam = 'pyright.addoptionalforparam',
     }
 
     export import CompletionItemKind = lsp.CompletionItemKind;
     export import InlayHintKind = lsp.InlayHintKind;
+
+    export const IndexValueDetail = indexValueDetail;
 }

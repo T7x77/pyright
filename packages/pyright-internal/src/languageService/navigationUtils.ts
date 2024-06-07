@@ -7,21 +7,26 @@
  */
 import { Location } from 'vscode-languageserver-types';
 import { ReadOnlyFileSystem } from '../common/fileSystem';
-import { convertPathToUri } from '../common/pathUtils';
 import { DocumentRange } from '../common/textRange';
+import { Uri } from '../common/uri/uri';
+import { convertUriToLspUriString } from '../common/uri/uriUtils';
 
-export function canNavigateToFile(fs: ReadOnlyFileSystem, path: string): boolean {
-    return !fs.isInZipOrEgg(path);
+export function canNavigateToFile(fs: ReadOnlyFileSystem, path: Uri): boolean {
+    return !fs.isInZip(path);
 }
 
-export function convertDocumentRangesToLocation(fs: ReadOnlyFileSystem, ranges: DocumentRange[]): Location[] {
-    return ranges.map((range) => convertDocumentRangeToLocation(fs, range)).filter((loc) => !!loc) as Location[];
+export function convertDocumentRangesToLocation(
+    fs: ReadOnlyFileSystem,
+    ranges: DocumentRange[],
+    converter: (fs: ReadOnlyFileSystem, range: DocumentRange) => Location | undefined = convertDocumentRangeToLocation
+): Location[] {
+    return ranges.map((range) => converter(fs, range)).filter((loc) => !!loc) as Location[];
 }
 
 export function convertDocumentRangeToLocation(fs: ReadOnlyFileSystem, range: DocumentRange): Location | undefined {
-    if (!canNavigateToFile(fs, range.path)) {
+    if (!canNavigateToFile(fs, range.uri)) {
         return undefined;
     }
 
-    return Location.create(convertPathToUri(fs, range.path), range.range);
+    return Location.create(convertUriToLspUriString(fs, range.uri), range.range);
 }

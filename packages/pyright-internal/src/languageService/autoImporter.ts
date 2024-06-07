@@ -12,15 +12,15 @@ import { DeclarationType } from '../analyzer/declaration';
 import { ImportResolver, ModuleNameAndType } from '../analyzer/importResolver';
 import { ImportType } from '../analyzer/importResult';
 import {
+    ImportGroup,
+    ImportNameInfo,
+    ImportStatements,
+    ModuleNameInfo,
     getImportGroup,
     getImportGroupFromModuleNameAndType,
     getTextEditsForAutoImportInsertion,
     getTextEditsForAutoImportSymbolAddition,
     getTopLevelImports,
-    ImportGroup,
-    ImportNameInfo,
-    ImportStatements,
-    ModuleNameInfo,
 } from '../analyzer/importStatementUtils';
 import { isUserCode } from '../analyzer/sourceFileInfoUtils';
 import { Symbol } from '../analyzer/symbol';
@@ -30,13 +30,14 @@ import { throwIfCancellationRequested } from '../common/cancellationUtils';
 import { appendArray } from '../common/collectionUtils';
 import { ExecutionEnvironment } from '../common/configOptions';
 import { TextEditAction } from '../common/editAction';
-import { combinePaths, getDirectoryPath, getFileName, stripFileExtension } from '../common/pathUtils';
+import { SourceFileInfo } from '../common/extensibility';
+import { stripFileExtension } from '../common/pathUtils';
 import * as StringUtils from '../common/stringUtils';
 import { Position } from '../common/textRange';
+import { Uri } from '../common/uri/uri';
 import { ParseNodeType } from '../parser/parseNodes';
-import { ParseResults } from '../parser/parser';
+import { ParseFileResults } from '../parser/parser';
 import { CompletionMap } from './completionProvider';
-import { SourceFileInfo } from '../common/extensibility';
 import { IndexAliasData } from './symbolIndexer';
 
 export interface AutoImportSymbol {
@@ -47,6 +48,7 @@ export interface AutoImportSymbol {
 }
 
 export interface ModuleSymbolTable {
+    uri: Uri;
     forEach(callbackfn: (symbol: AutoImportSymbol, name: string, library: boolean) => void): void;
 }
 
@@ -54,9 +56,12 @@ export type ModuleSymbolMap = Map<string, ModuleSymbolTable>;
 
 export interface AutoImportResult {
     readonly name: string;
+    readonly declUri: Uri;
+    readonly originalName: string;
+    readonly originalDeclUri: Uri;
+    readonly insertionText: string;
     readonly symbol?: Symbol;
     readonly source?: string;
-    readonly insertionText: string;
     readonly edits?: TextEditAction[];
     readonly alias?: string;
     readonly kind?: CompletionItemKind;
@@ -72,7 +77,7 @@ export interface ImportParts {
     readonly importName: string;
     readonly symbolName?: string;
     readonly importFrom?: string;
-    readonly filePath: string;
+    readonly fileUri: Uri;
     readonly dotCount: number;
     readonly moduleNameAndType: ModuleNameAndType;
 }
@@ -83,6 +88,7 @@ export interface ImportAliasData {
     readonly symbol?: Symbol;
     readonly kind?: SymbolKind;
     readonly itemKind?: CompletionItemKind;
+    readonly fileUri: Uri;
 }
 
 export type AutoImportResultMap = Map<string, AutoImportResult[]>;
@@ -103,13 +109,13 @@ export function addModuleSymbolsMap(files: readonly SourceFileInfo[], moduleSymb
             return;
         }
 
-        const filePath = file.sourceFile.getFilePath();
+        const uri = file.sourceFile.getUri();
         const symbolTable = file.sourceFile.getModuleSymbolTable();
         if (!symbolTable) {
             return;
         }
 
-        const fileName = stripFileExtension(getFileName(filePath));
+        const fileName = stripFileExtension(uri.fileName);
 
         // Don't offer imports from files that are named with private
         // naming semantics like "_ast.py".
@@ -117,7 +123,8 @@ export function addModuleSymbolsMap(files: readonly SourceFileInfo[], moduleSymb
             return;
         }
 
-        moduleSymbolMap.set(filePath, {
+        moduleSymbolMap.set(uri.key, {
+            uri,
             forEach(callbackfn: (value: AutoImportSymbol, key: string, library: boolean) => void): void {
                 symbolTable.forEach((symbol, name) => {
                     if (!isVisibleExternally(symbol)) {
@@ -158,13 +165,16 @@ export class AutoImporter {
     constructor(
         protected readonly execEnvironment: ExecutionEnvironment,
         protected readonly importResolver: ImportResolver,
-        protected readonly parseResults: ParseResults,
+        protected readonly parseResults: ParseFileResults,
         private readonly _invocationPosition: Position,
         private readonly _excludes: CompletionMap,
         protected readonly moduleSymbolMap: ModuleSymbolMap,
         protected readonly options: AutoImportOptions
     ) {
-        this._importStatements = getTopLevelImports(this.parseResults.parseTree, /* includeImplicitImports */ true);
+        this._importStatements = getTopLevelImports(
+            this.parseResults.parserOutput.parseTree,
+            /* includeImplicitImports */ true
+        );
     }
 
     getAutoImportCandidates(
@@ -203,12 +213,12 @@ export class AutoImporter {
         results: AutoImportResultMap,
         token: CancellationToken
     ) {
-        this.moduleSymbolMap.forEach((topLevelSymbols, filePath) => {
+        this.moduleSymbolMap.forEach((topLevelSymbols, key) => {
             // See if this file should be offered as an implicit import.
-            const isStubFileOrHasInit = this.isStubFileOrHasInit(this.moduleSymbolMap!, filePath);
+            const isStubFileOrHasInit = this.isStubFileOrHasInit(this.moduleSymbolMap!, topLevelSymbols.uri);
             this.processModuleSymbolTable(
                 topLevelSymbols,
-                filePath,
+                topLevelSymbols.uri,
                 word,
                 similarityLimit,
                 isStubFileOrHasInit,
@@ -229,7 +239,7 @@ export class AutoImporter {
         throwIfCancellationRequested(token);
 
         importAliasMap.forEach((mapPerSymbolName) => {
-            mapPerSymbolName.forEach((importAliasData) => {
+            mapPerSymbolName.forEach((importAliasData, originalName) => {
                 if (abbrFromUsers) {
                     // When alias name is used, our regular exclude mechanism would not work. we need to check
                     // whether import, the alias is referring to, already exists.
@@ -241,7 +251,7 @@ export class AutoImporter {
 
                     // If import statement for the module already exist, then bail out.
                     // ex) import module[.submodule] or from module[.submodule] import symbol
-                    if (this._importStatements.mapByFilePath.has(importAliasData.importParts.filePath)) {
+                    if (this._importStatements.mapByFilePath.has(importAliasData.importParts.fileUri.key)) {
                         return;
                     }
 
@@ -278,7 +288,7 @@ export class AutoImporter {
                     },
                     importAliasData.importParts.importName,
                     importAliasData.importGroup,
-                    importAliasData.importParts.filePath
+                    importAliasData.importParts.fileUri
                 );
 
                 this._addResult(results, {
@@ -289,6 +299,9 @@ export class AutoImporter {
                     source: importAliasData.importParts.importFrom,
                     insertionText: autoImportTextEdits.insertionText,
                     edits: autoImportTextEdits.edits,
+                    declUri: importAliasData.importParts.fileUri,
+                    originalName,
+                    originalDeclUri: importAliasData.fileUri,
                 });
             });
         });
@@ -296,7 +309,7 @@ export class AutoImporter {
 
     protected processModuleSymbolTable(
         topLevelSymbols: ModuleSymbolTable,
-        moduleFilePath: string,
+        moduleUri: Uri,
         word: string,
         similarityLimit: number,
         isStubOrHasInit: { isStub: boolean; hasInit: boolean },
@@ -307,7 +320,7 @@ export class AutoImporter {
     ) {
         throwIfCancellationRequested(token);
 
-        const [importSource, importGroup, moduleNameAndType] = this._getImportPartsForSymbols(moduleFilePath);
+        const [importSource, importGroup, moduleNameAndType] = this._getImportPartsForSymbols(moduleUri);
         if (!importSource) {
             return;
         }
@@ -340,7 +353,7 @@ export class AutoImporter {
                             symbolName: name,
                             importName: name,
                             importFrom: importSource,
-                            filePath: moduleFilePath,
+                            fileUri: moduleUri,
                             dotCount,
                             moduleNameAndType,
                         },
@@ -348,19 +361,20 @@ export class AutoImporter {
                         symbol: autoImportSymbol.symbol,
                         kind: autoImportSymbol.importAlias.kind,
                         itemKind: autoImportSymbol.importAlias.itemKind,
+                        fileUri: autoImportSymbol.importAlias.moduleUri,
                     },
                     importAliasMap
                 );
                 return;
             }
 
-            const nameForImportFrom = this.getNameForImportFrom(library, moduleFilePath);
+            const nameForImportFrom = this.getNameForImportFrom(library, moduleUri);
             const autoImportTextEdits = this._getTextEditsForAutoImportByFilePath(
                 { name, alias: abbrFromUsers },
                 { name: importSource, nameForImportFrom },
                 name,
                 importGroup,
-                moduleFilePath
+                moduleUri
             );
 
             this._addResult(results, {
@@ -371,6 +385,9 @@ export class AutoImporter {
                 kind: autoImportSymbol.itemKind ?? convertSymbolKindToCompletionItemKind(autoImportSymbol.kind),
                 insertionText: autoImportTextEdits.insertionText,
                 edits: autoImportTextEdits.edits,
+                declUri: moduleUri,
+                originalName: name,
+                originalDeclUri: moduleUri,
             });
         });
 
@@ -381,7 +398,7 @@ export class AutoImporter {
             return;
         }
 
-        const importParts = this._getImportParts(moduleFilePath);
+        const importParts = this._getImportParts(moduleUri);
         if (!importParts) {
             return;
         }
@@ -398,26 +415,32 @@ export class AutoImporter {
 
         this._addToImportAliasMap(
             {
-                modulePath: moduleFilePath,
+                moduleUri,
                 originalName: importParts.importName,
                 kind: SymbolKind.Module,
                 itemKind: CompletionItemKind.Module,
             },
-            { importParts, importGroup, kind: SymbolKind.Module, itemKind: CompletionItemKind.Module },
+            {
+                importParts,
+                importGroup,
+                kind: SymbolKind.Module,
+                itemKind: CompletionItemKind.Module,
+                fileUri: moduleUri,
+            },
             importAliasMap
         );
     }
 
-    protected getNameForImportFrom(library: boolean, moduleFilePath: string): string | undefined {
+    protected getNameForImportFrom(library: boolean, moduleUri: Uri): string | undefined {
         return undefined;
     }
 
-    protected isStubFileOrHasInit<T>(map: Map<string, T>, filePath: string) {
-        const fileDir = getDirectoryPath(filePath);
-        const initPathPy = combinePaths(fileDir, '__init__.py');
-        const initPathPyi = initPathPy + 'i';
-        const isStub = filePath.endsWith('.pyi');
-        const hasInit = map.has(initPathPy) || map.has(initPathPyi);
+    protected isStubFileOrHasInit<T>(map: Map<string, T>, uri: Uri) {
+        const fileDir = uri.getDirectory();
+        const initPathPy = fileDir.initPyUri;
+        const initPathPyi = fileDir.initPyiUri;
+        const isStub = uri.hasExtension('.pyi');
+        const hasInit = map.has(initPathPy.key) || map.has(initPathPyi.key);
         return { isStub, hasInit };
     }
 
@@ -448,14 +471,14 @@ export class AutoImporter {
         // Since we don't resolve alias declaration using type evaluator, there is still a chance
         // where we show multiple aliases for same symbols. but this should still reduce number of
         // such cases.
-        if (!importAliasMap.has(alias.modulePath)) {
+        if (!importAliasMap.has(alias.moduleUri.key)) {
             const map = new Map<string, ImportAliasData>();
             map.set(alias.originalName, data);
-            importAliasMap.set(alias.modulePath, map);
+            importAliasMap.set(alias.moduleUri.key, map);
             return;
         }
 
-        const map = importAliasMap.get(alias.modulePath)!;
+        const map = importAliasMap.get(alias.moduleUri.key)!;
         if (!map.has(alias.originalName)) {
             map.set(alias.originalName, data);
             return;
@@ -494,8 +517,8 @@ export class AutoImporter {
         return StringUtils.getStringComparer()(left.importParts.importName, right.importParts.importName);
     }
 
-    private _getImportPartsForSymbols(filePath: string): [string | undefined, ImportGroup, ModuleNameAndType] {
-        const localImport = this._importStatements.mapByFilePath.get(filePath);
+    private _getImportPartsForSymbols(uri: Uri): [string | undefined, ImportGroup, ModuleNameAndType] {
+        const localImport = this._importStatements.mapByFilePath.get(uri.key);
         if (localImport) {
             return [
                 localImport.moduleName,
@@ -507,7 +530,7 @@ export class AutoImporter {
                 },
             ];
         } else {
-            const moduleNameAndType = this._getModuleNameAndTypeFromFilePath(filePath);
+            const moduleNameAndType = this._getModuleNameAndTypeFromFilePath(uri);
             return [
                 moduleNameAndType.moduleName,
                 getImportGroupFromModuleNameAndType(moduleNameAndType),
@@ -516,15 +539,15 @@ export class AutoImporter {
         }
     }
 
-    private _getImportParts(filePath: string) {
-        const name = stripFileExtension(getFileName(filePath));
+    private _getImportParts(uri: Uri) {
+        const name = stripFileExtension(uri.fileName);
 
         // See if we can import module as "import xxx"
         if (name === '__init__') {
-            return createImportParts(this._getModuleNameAndTypeFromFilePath(getDirectoryPath(filePath)));
+            return createImportParts(this._getModuleNameAndTypeFromFilePath(uri.getDirectory()));
         }
 
-        return createImportParts(this._getModuleNameAndTypeFromFilePath(filePath));
+        return createImportParts(this._getModuleNameAndTypeFromFilePath(uri));
 
         function createImportParts(module: ModuleNameAndType): ImportParts | undefined {
             const moduleName = module.moduleName;
@@ -539,7 +562,7 @@ export class AutoImporter {
                 symbolName: importNamePart,
                 importName: importNamePart ?? moduleName,
                 importFrom,
-                filePath,
+                fileUri: uri,
                 dotCount: StringUtils.getCharacterCount(moduleName, '.'),
                 moduleNameAndType: module,
             };
@@ -587,8 +610,8 @@ export class AutoImporter {
     // Given the file path of a module that we want to import,
     // convert to a module name that can be used in an
     // 'import from' statement.
-    private _getModuleNameAndTypeFromFilePath(filePath: string): ModuleNameAndType {
-        return this.importResolver.getModuleNameForImport(filePath, this.execEnvironment);
+    private _getModuleNameAndTypeFromFilePath(uri: Uri): ModuleNameAndType {
+        return this.importResolver.getModuleNameForImport(uri, this.execEnvironment);
     }
 
     private _getTextEditsForAutoImportByFilePath(
@@ -596,10 +619,10 @@ export class AutoImporter {
         moduleNameInfo: ModuleNameInfo,
         insertionText: string,
         importGroup: ImportGroup,
-        filePath: string
+        fileUri: Uri
     ): { insertionText: string; edits?: TextEditAction[] | undefined } {
         // If there is no symbolName, there can't be existing import statement.
-        const importStatement = this._importStatements.mapByFilePath.get(filePath);
+        const importStatement = this._importStatements.mapByFilePath.get(fileUri.key);
         if (importStatement) {
             // Found import for given module. See whether we can use the module as it is.
             if (importStatement.node.nodeType === ParseNodeType.Import) {
@@ -685,7 +708,7 @@ export class AutoImporter {
             }
 
             // Check whether it is one of implicit imports
-            const importFrom = this._importStatements.implicitImports?.get(filePath);
+            const importFrom = this._importStatements.implicitImports?.get(fileUri.key);
             if (importFrom) {
                 // For now, we don't check whether alias or moduleName got overwritten at
                 // given position

@@ -1,7 +1,8 @@
 name: 'Validation'
 
 env:
-  NODE_VERSION: '16' # Shipped with VS Code.
+  NODE_VERSION: '18' # Shipped with VS Code.
+  PYTHON_VERSION: 3.11
 
 on:
   push:
@@ -18,16 +19,17 @@ jobs:
     name: Typecheck
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
 
       - name: Get npm cache directory
         id: npm-cache
+        shell: bash
         run: |
-          echo "::set-output name=dir::$(npm config get cache)"
+          echo "dir=$(npm config get cache)" >> $GITHUB_OUTPUT
       - uses: actions/cache@v3
         with:
           path: ${{ steps.npm-cache.outputs.dir }}
@@ -45,16 +47,17 @@ jobs:
     name: Style
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
 
       - name: Get npm cache directory
         id: npm-cache
+        shell: bash
         run: |
-          echo "::set-output name=dir::$(npm config get cache)"
+          echo "dir=$(npm config get cache)" >> $GITHUB_OUTPUT
       - uses: actions/cache@v3
         with:
           path: ${{ steps.npm-cache.outputs.dir }}
@@ -80,9 +83,9 @@ jobs:
     needs: typecheck
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
 
@@ -91,8 +94,9 @@ jobs:
       - name: Get npm cache directory
         if: runner.os != 'Windows'
         id: npm-cache
+        shell: bash
         run: |
-          echo "::set-output name=dir::$(npm config get cache)"
+          echo "dir=$(npm config get cache)" >> $GITHUB_OUTPUT
       - uses: actions/cache@v3
         if: runner.os != 'Windows'
         with:
@@ -107,22 +111,65 @@ jobs:
         run: npm test
         working-directory: packages/pyright-internal
 
+      # Install python so we can create a VENV for tests
+      - name: Use Python ${{env.PYTHON_VERSION}}
+        uses: actions/setup-python@v5
+        id: install_python
+        with:
+          python-version: ${{env.PYTHON_VERSION}}
+
+      - name: Create Venv
+        run: |
+          ${{ steps.install_python.outputs.python-path }} -m venv .venv
+
+      - name: Activate and install pytest (linux)
+        if: runner.os != 'Windows'
+        run: |
+          source .venv/bin/activate
+          python -m pip install pytest
+          python -c "import sys;print('python_venv_path=' + sys.executable)" >> $GITHUB_ENV
+
+      - name: Activate and install pytest (windows)
+        if: runner.os == 'Windows'
+        run: |
+          .venv\scripts\activate
+          python -m pip install pytest
+          python -c "import sys;print('python_venv_path=' + sys.executable)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Echo python_venv_path
+        run: |
+          echo python_venv_path=${{env.python_venv_path}}
+
+      - name: Run import tests with venv
+        env:
+          CI_IMPORT_TEST_VENVPATH: '../../'
+          CI_IMPORT_TEST_VENV: '.venv'
+        run: npm run test:imports
+        working-directory: packages/pyright-internal
+
+      - name: Run import tests with pythonpath
+        env:
+          CI_IMPORT_TEST_PYTHONPATH: ${{env.python_venv_path}}
+        run: npm run test:imports
+        working-directory: packages/pyright-internal
+
   build:
     runs-on: ubuntu-latest
     name: Build
     needs: typecheck
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
 
       - name: Get npm cache directory
         id: npm-cache
+        shell: bash
         run: |
-          echo "::set-output name=dir::$(npm config get cache)"
+          echo "dir=$(npm config get cache)" >> $GITHUB_OUTPUT
       - uses: actions/cache@v3
         with:
           path: ${{ steps.npm-cache.outputs.dir }}

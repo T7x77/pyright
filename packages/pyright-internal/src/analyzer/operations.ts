@@ -10,8 +10,8 @@
 
 import { DiagnosticAddendum } from '../common/diagnostic';
 import { DiagnosticRule } from '../common/diagnosticRules';
-import { PythonVersion } from '../common/pythonVersion';
-import { Localizer } from '../localization/localize';
+import { pythonVersion3_10 } from '../common/pythonVersion';
+import { LocMessage } from '../localization/localize';
 import {
     AugmentedAssignmentNode,
     BinaryOperationNode,
@@ -22,14 +22,17 @@ import {
 } from '../parser/parseNodes';
 import { OperatorType } from '../parser/tokenizerTypes';
 import { getFileInfo } from './analyzerNodeInfo';
-import { isWithinLoop, operatorSupportsChaining, printOperator } from './parseTreeUtils';
+import { getEnclosingLambda, isWithinLoop, operatorSupportsChaining, printOperator } from './parseTreeUtils';
+import { getScopeForNode } from './scopeUtils';
 import { evaluateStaticBoolExpression } from './staticExpressions';
 import { EvaluatorFlags, TypeEvaluator, TypeResult } from './typeEvaluatorTypes';
 import {
     InferenceContext,
+    convertToInstantiable,
     getLiteralTypeClassName,
     getTypeCondition,
     getUnionSubtypeCount,
+    isNoneInstance,
     isOptionalType,
     isTupleClass,
     isUnboundedTupleClass,
@@ -38,12 +41,14 @@ import {
     makeInferenceContext,
     mapSubtypes,
     preserveUnknown,
+    removeNoneFromUnion,
+    someSubtypes,
     specializeTupleClass,
+    transformPossibleRecursiveTypeAlias,
 } from './typeUtils';
 import {
     ClassType,
     NeverType,
-    NoneType,
     Type,
     TypeBase,
     UnknownType,
@@ -54,10 +59,8 @@ import {
     isFunction,
     isInstantiableClass,
     isNever,
-    isNoneInstance,
     isOverloadedFunction,
     isUnion,
-    removeNoneFromUnion,
 } from './types';
 
 // Maps binary operators to the magic methods that implement them.
@@ -111,7 +114,7 @@ export function validateBinaryOperation(
     inferenceContext: InferenceContext | undefined,
     diag: DiagnosticAddendum,
     options: BinaryOperationOptions
-): Type | undefined {
+): Type {
     const leftType = leftTypeResult.type;
     const rightType = rightTypeResult.type;
     let type: Type | undefined;
@@ -167,20 +170,20 @@ export function validateBinaryOperation(
         if (operator === OperatorType.In || operator === OperatorType.NotIn) {
             type = evaluator.mapSubtypesExpandTypeVars(
                 rightType,
-                /* conditionFilter */ undefined,
+                /* options */ undefined,
                 (rightSubtypeExpanded, rightSubtypeUnexpanded) => {
                     return evaluator.mapSubtypesExpandTypeVars(
                         concreteLeftType,
-                        getTypeCondition(rightSubtypeExpanded),
+                        { conditionFilter: getTypeCondition(rightSubtypeExpanded) },
                         (leftSubtype) => {
                             if (isAnyOrUnknown(leftSubtype) || isAnyOrUnknown(rightSubtypeUnexpanded)) {
                                 return preserveUnknown(leftSubtype, rightSubtypeExpanded);
                             }
 
-                            let returnType = evaluator.getTypeOfMagicMethodReturn(
+                            let returnType = evaluator.getTypeOfMagicMethodCall(
                                 rightSubtypeExpanded,
-                                [{ type: leftSubtype, isIncomplete: leftTypeResult.isIncomplete }],
                                 '__contains__',
+                                [{ type: leftSubtype, isIncomplete: leftTypeResult.isIncomplete }],
                                 errorNode,
                                 /* inferenceContext */ undefined
                             );
@@ -191,7 +194,8 @@ export function validateBinaryOperation(
                                 const iteratorType = evaluator.getTypeOfIterator(
                                     { type: rightSubtypeExpanded, isIncomplete: rightTypeResult.isIncomplete },
                                     /* isAsync */ false,
-                                    /* errorNode */ undefined
+                                    errorNode,
+                                    /* emitNotIterableError */ false
                                 )?.type;
 
                                 if (iteratorType && evaluator.assignType(iteratorType, leftSubtype)) {
@@ -201,7 +205,7 @@ export function validateBinaryOperation(
 
                             if (!returnType) {
                                 diag.addMessage(
-                                    Localizer.Diagnostic.typeNotSupportBinaryOperator().format({
+                                    LocMessage.typeNotSupportBinaryOperator().format({
                                         operator: printOperator(operator),
                                         leftType: evaluator.printType(leftSubtype),
                                         rightType: evaluator.printType(rightSubtypeExpanded),
@@ -222,11 +226,11 @@ export function validateBinaryOperation(
         } else {
             type = evaluator.mapSubtypesExpandTypeVars(
                 concreteLeftType,
-                /* conditionFilter */ undefined,
+                /* options */ undefined,
                 (leftSubtypeExpanded, leftSubtypeUnexpanded) => {
                     return evaluator.mapSubtypesExpandTypeVars(
                         rightType,
-                        getTypeCondition(leftSubtypeExpanded),
+                        { conditionFilter: getTypeCondition(leftSubtypeExpanded) },
                         (rightSubtypeExpanded, rightSubtypeUnexpanded) => {
                             // If the operator is an AND or OR, we need to combine the two types.
                             if (operator === OperatorType.And || operator === OperatorType.Or) {
@@ -348,11 +352,11 @@ export function validateBinaryOperation(
         if (!type) {
             type = evaluator.mapSubtypesExpandTypeVars(
                 leftType,
-                /* conditionFilter */ undefined,
+                /* options */ undefined,
                 (leftSubtypeExpanded, leftSubtypeUnexpanded) => {
                     return evaluator.mapSubtypesExpandTypeVars(
                         rightType,
-                        getTypeCondition(leftSubtypeExpanded),
+                        { conditionFilter: getTypeCondition(leftSubtypeExpanded) },
                         (rightSubtypeExpanded, rightSubtypeUnexpanded) => {
                             if (isAnyOrUnknown(leftSubtypeUnexpanded) || isAnyOrUnknown(rightSubtypeUnexpanded)) {
                                 return preserveUnknown(leftSubtypeUnexpanded, rightSubtypeUnexpanded);
@@ -367,37 +371,45 @@ export function validateBinaryOperation(
                                 isClassInstance(leftSubtypeExpanded) &&
                                 isTupleClass(leftSubtypeExpanded) &&
                                 leftSubtypeExpanded.tupleTypeArguments &&
-                                !isUnboundedTupleClass(leftSubtypeExpanded) &&
                                 isClassInstance(rightSubtypeExpanded) &&
                                 isTupleClass(rightSubtypeExpanded) &&
                                 rightSubtypeExpanded.tupleTypeArguments &&
-                                !isUnboundedTupleClass(rightSubtypeExpanded) &&
                                 tupleClassType &&
                                 isInstantiableClass(tupleClassType)
                             ) {
-                                return ClassType.cloneAsInstance(
-                                    specializeTupleClass(tupleClassType, [
-                                        ...leftSubtypeExpanded.tupleTypeArguments,
-                                        ...rightSubtypeExpanded.tupleTypeArguments,
-                                    ])
-                                );
+                                // If at least one of the tuples is of fixed size, we can
+                                // combine them into a precise new type. If both are unbounded
+                                // (or contain an unbounded element), we cannot combine them
+                                // in this manner because tuples can contain at most one
+                                // unbounded element.
+                                if (
+                                    !isUnboundedTupleClass(leftSubtypeExpanded) ||
+                                    !isUnboundedTupleClass(rightSubtypeExpanded)
+                                ) {
+                                    return ClassType.cloneAsInstance(
+                                        specializeTupleClass(tupleClassType, [
+                                            ...leftSubtypeExpanded.tupleTypeArguments,
+                                            ...rightSubtypeExpanded.tupleTypeArguments,
+                                        ])
+                                    );
+                                }
                             }
 
                             const magicMethodName = binaryOperatorMap[operator][0];
-                            let resultType = evaluator.getTypeOfMagicMethodReturn(
+                            let resultType = evaluator.getTypeOfMagicMethodCall(
                                 convertFunctionToObject(evaluator, leftSubtypeUnexpanded),
-                                [{ type: rightSubtypeUnexpanded, isIncomplete: rightTypeResult.isIncomplete }],
                                 magicMethodName,
+                                [{ type: rightSubtypeUnexpanded, isIncomplete: rightTypeResult.isIncomplete }],
                                 errorNode,
                                 inferenceContext
                             );
 
                             if (!resultType && leftSubtypeUnexpanded !== leftSubtypeExpanded) {
                                 // Try the expanded left type.
-                                resultType = evaluator.getTypeOfMagicMethodReturn(
+                                resultType = evaluator.getTypeOfMagicMethodCall(
                                     convertFunctionToObject(evaluator, leftSubtypeExpanded),
-                                    [{ type: rightSubtypeUnexpanded, isIncomplete: rightTypeResult.isIncomplete }],
                                     magicMethodName,
+                                    [{ type: rightSubtypeUnexpanded, isIncomplete: rightTypeResult.isIncomplete }],
                                     errorNode,
                                     inferenceContext
                                 );
@@ -405,10 +417,10 @@ export function validateBinaryOperation(
 
                             if (!resultType && rightSubtypeUnexpanded !== rightSubtypeExpanded) {
                                 // Try the expanded left and right type.
-                                resultType = evaluator.getTypeOfMagicMethodReturn(
+                                resultType = evaluator.getTypeOfMagicMethodCall(
                                     convertFunctionToObject(evaluator, leftSubtypeExpanded),
-                                    [{ type: rightSubtypeExpanded, isIncomplete: rightTypeResult.isIncomplete }],
                                     magicMethodName,
+                                    [{ type: rightSubtypeExpanded, isIncomplete: rightTypeResult.isIncomplete }],
                                     errorNode,
                                     inferenceContext
                                 );
@@ -417,25 +429,25 @@ export function validateBinaryOperation(
                             if (!resultType) {
                                 // Try the alternate form (swapping right and left).
                                 const altMagicMethodName = binaryOperatorMap[operator][1];
-                                resultType = evaluator.getTypeOfMagicMethodReturn(
+                                resultType = evaluator.getTypeOfMagicMethodCall(
                                     convertFunctionToObject(evaluator, rightSubtypeUnexpanded),
-                                    [{ type: leftSubtypeUnexpanded, isIncomplete: leftTypeResult.isIncomplete }],
                                     altMagicMethodName,
+                                    [{ type: leftSubtypeUnexpanded, isIncomplete: leftTypeResult.isIncomplete }],
                                     errorNode,
                                     inferenceContext
                                 );
 
                                 if (!resultType && rightSubtypeUnexpanded !== rightSubtypeExpanded) {
                                     // Try the expanded right type.
-                                    resultType = evaluator.getTypeOfMagicMethodReturn(
+                                    resultType = evaluator.getTypeOfMagicMethodCall(
                                         convertFunctionToObject(evaluator, rightSubtypeExpanded),
+                                        altMagicMethodName,
                                         [
                                             {
                                                 type: leftSubtypeUnexpanded,
                                                 isIncomplete: leftTypeResult.isIncomplete,
                                             },
                                         ],
-                                        altMagicMethodName,
                                         errorNode,
                                         inferenceContext
                                     );
@@ -443,10 +455,10 @@ export function validateBinaryOperation(
 
                                 if (!resultType && leftSubtypeUnexpanded !== leftSubtypeExpanded) {
                                     // Try the expanded right and left type.
-                                    resultType = evaluator.getTypeOfMagicMethodReturn(
+                                    resultType = evaluator.getTypeOfMagicMethodCall(
                                         convertFunctionToObject(evaluator, rightSubtypeExpanded),
-                                        [{ type: leftSubtypeExpanded, isIncomplete: leftTypeResult.isIncomplete }],
                                         altMagicMethodName,
+                                        [{ type: leftSubtypeExpanded, isIncomplete: leftTypeResult.isIncomplete }],
                                         errorNode,
                                         inferenceContext
                                     );
@@ -456,7 +468,7 @@ export function validateBinaryOperation(
                             if (!resultType) {
                                 if (inferenceContext) {
                                     diag.addMessage(
-                                        Localizer.Diagnostic.typeNotSupportBinaryOperatorBidirectional().format({
+                                        LocMessage.typeNotSupportBinaryOperatorBidirectional().format({
                                             operator: printOperator(operator),
                                             leftType: evaluator.printType(leftSubtypeExpanded),
                                             rightType: evaluator.printType(rightSubtypeExpanded),
@@ -465,7 +477,7 @@ export function validateBinaryOperation(
                                     );
                                 } else {
                                     diag.addMessage(
-                                        Localizer.Diagnostic.typeNotSupportBinaryOperator().format({
+                                        LocMessage.typeNotSupportBinaryOperator().format({
                                             operator: printOperator(operator),
                                             leftType: evaluator.printType(leftSubtypeExpanded),
                                             rightType: evaluator.printType(rightSubtypeExpanded),
@@ -481,7 +493,7 @@ export function validateBinaryOperation(
         }
     }
 
-    return type && isNever(type) ? undefined : type;
+    return type ?? UnknownType.create();
 }
 
 export function getTypeOfBinaryOperation(
@@ -546,9 +558,21 @@ export function getTypeOfBinaryOperation(
 
     if (!expectedOperandType) {
         if (node.operator === OperatorType.Or || node.operator === OperatorType.And) {
-            // For "or" and "and", use the type of the left operand. This allows us to
-            // infer a better type for expressions like `x or []`.
-            expectedOperandType = leftType;
+            // For "or" and "and", use the type of the left operand under certain
+            // circumstances. This allows us to infer a better type for expressions
+            // like `x or []`. Do this only if it's a generic class (like list or dict)
+            // or a TypedDict.
+            if (
+                someSubtypes(leftType, (subtype) => {
+                    if (!isClassInstance(subtype)) {
+                        return false;
+                    }
+
+                    return ClassType.isTypedDictClass(subtype) || subtype.details.typeParameters.length > 0;
+                })
+            ) {
+                expectedOperandType = leftType;
+            }
         } else if (node.operator === OperatorType.Add && node.rightExpression.nodeType === ParseNodeType.List) {
             // For the "+" operator , use this technique only if the right operand is
             // a list expression. This heuristic handles the common case of `my_list + [0]`.
@@ -587,9 +611,9 @@ export function getTypeOfBinaryOperation(
             // with something else. Even though "None" will normally be interpreted
             // as the None singleton object in contexts where a type annotation isn't
             // assumed, we'll allow it here.
-            adjustedRightType = NoneType.createType();
+            adjustedRightType = convertToInstantiable(evaluator.getNoneType());
         } else if (!isNoneInstance(rightType) && isNoneInstance(leftType)) {
-            adjustedLeftType = NoneType.createType();
+            adjustedLeftType = convertToInstantiable(evaluator.getNoneType());
         }
 
         if (isUnionableType([adjustedLeftType, adjustedRightType])) {
@@ -597,25 +621,25 @@ export function getTypeOfBinaryOperation(
             const unionNotationSupported =
                 fileInfo.isStubFile ||
                 (flags & EvaluatorFlags.AllowForwardReferences) !== 0 ||
-                fileInfo.executionEnvironment.pythonVersion >= PythonVersion.V3_10;
+                fileInfo.executionEnvironment.pythonVersion.isGreaterOrEqualTo(pythonVersion3_10);
+
             if (!unionNotationSupported) {
                 // If the left type is Any, we can't say for sure whether this
                 // is an illegal syntax or a valid application of the "|" operator.
                 if (!isAnyOrUnknown(adjustedLeftType)) {
-                    evaluator.addError(Localizer.Diagnostic.unionSyntaxIllegal(), node, node.operatorToken);
+                    evaluator.addDiagnostic(
+                        DiagnosticRule.reportGeneralTypeIssues,
+                        LocMessage.unionSyntaxIllegal(),
+                        node,
+                        node.operatorToken
+                    );
                 }
             }
 
-            if (
-                !evaluator.validateTypeArg(
-                    { ...leftTypeResult, node: leftExpression },
-                    { allowVariadicTypeVar: true, allowUnpackedTuples: true }
-                ) ||
-                !evaluator.validateTypeArg(
-                    { ...rightTypeResult, node: rightExpression },
-                    { allowVariadicTypeVar: true, allowUnpackedTuples: true }
-                )
-            ) {
+            const isLeftTypeArgValid = evaluator.validateTypeArg({ ...leftTypeResult, node: leftExpression });
+            const isRightTypeArgValid = evaluator.validateTypeArg({ ...rightTypeResult, node: rightExpression });
+
+            if (!isLeftTypeArgValid || !isRightTypeArgValid) {
                 return { type: UnknownType.create() };
             }
 
@@ -630,9 +654,11 @@ export function getTypeOfBinaryOperation(
                 flags | EvaluatorFlags.ExpectingInstantiableType
             );
 
-            const newUnion = combineTypes([adjustedLeftType, adjustedRightType]);
-            if (isUnion(newUnion)) {
-                TypeBase.setSpecialForm(newUnion);
+            let newUnion = combineTypes([adjustedLeftType, adjustedRightType]);
+
+            const unionClass = evaluator.getUnionClassType();
+            if (unionClass && isInstantiableClass(unionClass)) {
+                newUnion = TypeBase.cloneAsSpecialForm(newUnion, ClassType.cloneAsInstance(unionClass));
             }
 
             // Check for "stringified" forward reference type expressions. The "|" operator
@@ -663,9 +689,8 @@ export function getTypeOfBinaryOperation(
 
                     if (!isAllowed) {
                         evaluator.addDiagnostic(
-                            fileInfo.diagnosticRuleSet.reportGeneralTypeIssues,
                             DiagnosticRule.reportGeneralTypeIssues,
-                            Localizer.Diagnostic.unionForwardReferenceNotAllowed(),
+                            LocMessage.unionForwardReferenceNotAllowed(),
                             stringNode
                         );
                     }
@@ -673,6 +698,14 @@ export function getTypeOfBinaryOperation(
             }
 
             return { type: newUnion };
+        }
+    }
+
+    if ((flags & EvaluatorFlags.ExpectingTypeAnnotation) !== 0) {
+        // Exempt "|" because it might be a union operation involving unknowns.
+        if (node.operator !== OperatorType.BitwiseOr) {
+            evaluator.addDiagnostic(DiagnosticRule.reportInvalidTypeForm, LocMessage.binaryOperationNotAllowed(), node);
+            return { type: UnknownType.create() };
         }
     }
 
@@ -694,9 +727,11 @@ export function getTypeOfBinaryOperation(
 
     const diag = new DiagnosticAddendum();
 
-    // Don't use literal math if either of the operation is within a loop
-    // because the literal values may change each time.
-    const isLiteralMathAllowed = !isWithinLoop(node);
+    // Don't use literal math if the operation is within a loop
+    // because the literal values may change each time. We also don't want to
+    // apply literal math within the body of a lambda because they are often
+    // used as callbacks where the value changes each time they are called.
+    const isLiteralMathAllowed = !isWithinLoop(node) && !getEnclosingLambda(node);
 
     // Don't special-case tuple __add__ if the left type is a union. This
     // can result in an infinite loop if we keep creating new tuple types
@@ -714,21 +749,18 @@ export function getTypeOfBinaryOperation(
         { isLiteralMathAllowed, isTupleAddAllowed }
     );
 
-    if (!diag.isEmpty() || !type) {
+    if (!diag.isEmpty()) {
         typeErrors = true;
 
         if (!isIncomplete) {
-            const fileInfo = getFileInfo(node);
-
             if (isLeftOptionalType && diag.getMessages().length === 1) {
                 // If the left was an optional type and there is just one diagnostic,
                 // assume that it was due to a "None" not being supported. Report
                 // this as a reportOptionalOperand diagnostic rather than a
                 // reportGeneralTypeIssues diagnostic.
                 evaluator.addDiagnostic(
-                    fileInfo.diagnosticRuleSet.reportOptionalOperand,
                     DiagnosticRule.reportOptionalOperand,
-                    Localizer.Diagnostic.noneOperator().format({
+                    LocMessage.noneOperator().format({
                         operator: printOperator(node.operator),
                     }),
                     node.leftExpression
@@ -746,9 +778,8 @@ export function getTypeOfBinaryOperation(
                 }
 
                 evaluator.addDiagnostic(
-                    fileInfo.diagnosticRuleSet.reportGeneralTypeIssues,
-                    DiagnosticRule.reportGeneralTypeIssues,
-                    Localizer.Diagnostic.typeNotSupportBinaryOperator().format({
+                    DiagnosticRule.reportOperatorIssue,
+                    LocMessage.typeNotSupportBinaryOperator().format({
                         operator: printOperator(node.operator),
                         leftType: evaluator.printType(leftType),
                         rightType: evaluator.printType(rightType),
@@ -812,31 +843,31 @@ export function getTypeOfAugmentedAssignment(
     } else {
         type = evaluator.mapSubtypesExpandTypeVars(
             leftType,
-            /* conditionFilter */ undefined,
+            /* options */ undefined,
             (leftSubtypeExpanded, leftSubtypeUnexpanded) => {
                 return evaluator.mapSubtypesExpandTypeVars(
                     rightType,
-                    getTypeCondition(leftSubtypeExpanded),
+                    { conditionFilter: getTypeCondition(leftSubtypeExpanded) },
                     (rightSubtypeExpanded, rightSubtypeUnexpanded) => {
                         if (isAnyOrUnknown(leftSubtypeUnexpanded) || isAnyOrUnknown(rightSubtypeUnexpanded)) {
                             return preserveUnknown(leftSubtypeUnexpanded, rightSubtypeUnexpanded);
                         }
 
                         const magicMethodName = operatorMap[node.operator][0];
-                        let returnType = evaluator.getTypeOfMagicMethodReturn(
+                        let returnType = evaluator.getTypeOfMagicMethodCall(
                             leftSubtypeUnexpanded,
-                            [{ type: rightSubtypeUnexpanded, isIncomplete: rightTypeResult.isIncomplete }],
                             magicMethodName,
+                            [{ type: rightSubtypeUnexpanded, isIncomplete: rightTypeResult.isIncomplete }],
                             node,
                             inferenceContext
                         );
 
                         if (!returnType && leftSubtypeUnexpanded !== leftSubtypeExpanded) {
                             // Try with the expanded left type.
-                            returnType = evaluator.getTypeOfMagicMethodReturn(
+                            returnType = evaluator.getTypeOfMagicMethodCall(
                                 leftSubtypeExpanded,
-                                [{ type: rightSubtypeUnexpanded, isIncomplete: rightTypeResult.isIncomplete }],
                                 magicMethodName,
+                                [{ type: rightSubtypeUnexpanded, isIncomplete: rightTypeResult.isIncomplete }],
                                 node,
                                 inferenceContext
                             );
@@ -844,10 +875,10 @@ export function getTypeOfAugmentedAssignment(
 
                         if (!returnType && rightSubtypeUnexpanded !== rightSubtypeExpanded) {
                             // Try with the expanded left and right type.
-                            returnType = evaluator.getTypeOfMagicMethodReturn(
+                            returnType = evaluator.getTypeOfMagicMethodCall(
                                 leftSubtypeExpanded,
-                                [{ type: rightSubtypeExpanded, isIncomplete: rightTypeResult.isIncomplete }],
                                 magicMethodName,
+                                [{ type: rightSubtypeExpanded, isIncomplete: rightTypeResult.isIncomplete }],
                                 node,
                                 inferenceContext
                             );
@@ -858,10 +889,11 @@ export function getTypeOfAugmentedAssignment(
                             // assignment, fall back on the normal binary expression evaluator.
                             const binaryOperator = operatorMap[node.operator][1];
 
-                            // Don't use literal math if either of the operation is within a loop
+                            // Don't use literal math if the operation is within a loop
                             // because the literal values may change each time.
                             const isLiteralMathAllowed =
                                 !isWithinLoop(node) &&
+                                isExpressionLocalVariable(evaluator, node.leftExpression) &&
                                 getUnionSubtypeCount(leftType) * getUnionSubtypeCount(rightType) <
                                     maxLiteralMathSubtypeCount;
 
@@ -892,11 +924,9 @@ export function getTypeOfAugmentedAssignment(
         // assignment, fall back on the normal binary expression evaluator.
         if (!diag.isEmpty() || !type || isNever(type)) {
             if (!isIncomplete) {
-                const fileInfo = getFileInfo(node);
                 evaluator.addDiagnostic(
-                    fileInfo.diagnosticRuleSet.reportGeneralTypeIssues,
-                    DiagnosticRule.reportGeneralTypeIssues,
-                    Localizer.Diagnostic.typeNotSupportBinaryOperator().format({
+                    DiagnosticRule.reportOperatorIssue,
+                    LocMessage.typeNotSupportBinaryOperator().format({
                         operator: printOperator(node.operator),
                         leftType: evaluator.printType(leftType),
                         rightType: evaluator.printType(rightType),
@@ -924,10 +954,17 @@ export function getTypeOfAugmentedAssignment(
 export function getTypeOfUnaryOperation(
     evaluator: TypeEvaluator,
     node: UnaryOperationNode,
+    flags: EvaluatorFlags,
     inferenceContext: InferenceContext | undefined
 ): TypeResult {
+    if ((flags & EvaluatorFlags.ExpectingTypeAnnotation) !== 0) {
+        evaluator.addDiagnostic(DiagnosticRule.reportInvalidTypeForm, LocMessage.unaryOperationNotAllowed(), node);
+        return { type: UnknownType.create() };
+    }
+
     const exprTypeResult = evaluator.getTypeOfExpression(node.expression);
-    let exprType = evaluator.makeTopLevelTypeVarsConcrete(exprTypeResult.type);
+    let exprType = evaluator.makeTopLevelTypeVarsConcrete(transformPossibleRecursiveTypeAlias(exprTypeResult.type));
+
     const isIncomplete = exprTypeResult.isIncomplete;
 
     if (isNever(exprType)) {
@@ -947,9 +984,8 @@ export function getTypeOfUnaryOperation(
     if (node.operator !== OperatorType.Not) {
         if (isOptionalType(exprType)) {
             evaluator.addDiagnostic(
-                getFileInfo(node).diagnosticRuleSet.reportOptionalOperand,
                 DiagnosticRule.reportOptionalOperand,
-                Localizer.Diagnostic.noneOperator().format({
+                LocMessage.noneOperator().format({
                     operator: printOperator(node.operator),
                 }),
                 node.expression
@@ -995,34 +1031,53 @@ export function getTypeOfUnaryOperation(
                 type = exprType;
             } else {
                 const magicMethodName = unaryOperatorMap[node.operator];
-                type = evaluator.getTypeOfMagicMethodReturn(exprType, [], magicMethodName, node, inferenceContext);
+                let isResultValid = true;
+
+                type = evaluator.mapSubtypesExpandTypeVars(exprType, /* options */ undefined, (subtypeExpanded) => {
+                    const result = evaluator.getTypeOfMagicMethodCall(
+                        subtypeExpanded,
+                        magicMethodName,
+                        [],
+                        node,
+                        inferenceContext
+                    );
+
+                    if (!result) {
+                        isResultValid = false;
+                    }
+
+                    return result;
+                });
+
+                if (!isResultValid) {
+                    type = undefined;
+                }
             }
 
             if (!type) {
-                const fileInfo = getFileInfo(node);
-
-                if (inferenceContext) {
-                    evaluator.addDiagnostic(
-                        fileInfo.diagnosticRuleSet.reportGeneralTypeIssues,
-                        DiagnosticRule.reportGeneralTypeIssues,
-                        Localizer.Diagnostic.typeNotSupportUnaryOperatorBidirectional().format({
-                            operator: printOperator(node.operator),
-                            type: evaluator.printType(exprType),
-                            expectedType: evaluator.printType(inferenceContext.expectedType),
-                        }),
-                        node
-                    );
-                } else {
-                    evaluator.addDiagnostic(
-                        fileInfo.diagnosticRuleSet.reportGeneralTypeIssues,
-                        DiagnosticRule.reportGeneralTypeIssues,
-                        Localizer.Diagnostic.typeNotSupportUnaryOperator().format({
-                            operator: printOperator(node.operator),
-                            type: evaluator.printType(exprType),
-                        }),
-                        node
-                    );
+                if (!isIncomplete) {
+                    if (inferenceContext) {
+                        evaluator.addDiagnostic(
+                            DiagnosticRule.reportOperatorIssue,
+                            LocMessage.typeNotSupportUnaryOperatorBidirectional().format({
+                                operator: printOperator(node.operator),
+                                type: evaluator.printType(exprType),
+                                expectedType: evaluator.printType(inferenceContext.expectedType),
+                            }),
+                            node
+                        );
+                    } else {
+                        evaluator.addDiagnostic(
+                            DiagnosticRule.reportOperatorIssue,
+                            LocMessage.typeNotSupportUnaryOperator().format({
+                                operator: printOperator(node.operator),
+                                type: evaluator.printType(exprType),
+                            }),
+                            node
+                        );
+                    }
                 }
+
                 type = UnknownType.create();
             }
         }
@@ -1037,13 +1092,19 @@ export function getTypeOfTernaryOperation(
     flags: EvaluatorFlags,
     inferenceContext: InferenceContext | undefined
 ): TypeResult {
+    const fileInfo = getFileInfo(node);
+
+    if ((flags & EvaluatorFlags.ExpectingTypeAnnotation) !== 0) {
+        evaluator.addDiagnostic(DiagnosticRule.reportInvalidTypeForm, LocMessage.ternaryNotAllowed(), node);
+        return { type: UnknownType.create() };
+    }
+
     evaluator.getTypeOfExpression(node.testExpression);
 
     const typesToCombine: Type[] = [];
     let isIncomplete = false;
     let typeErrors = false;
 
-    const fileInfo = getFileInfo(node);
     const constExprValue = evaluateStaticBoolExpression(
         node.testExpression,
         fileInfo.executionEnvironment,
@@ -1094,6 +1155,13 @@ function customMetaclassSupportsMethod(type: Type, methodName: string): boolean 
         return false;
     }
 
+    // If the metaclass inherits from Any or Unknown, we have to guess
+    // whether the method is supported. We'll assume it's not, since this
+    // is the most likely case.
+    if (isAnyOrUnknown(memberInfo.classType)) {
+        return false;
+    }
+
     if (isInstantiableClass(memberInfo.classType) && ClassType.isBuiltIn(memberInfo.classType, 'type')) {
         return false;
     }
@@ -1106,11 +1174,24 @@ function customMetaclassSupportsMethod(type: Type, methodName: string): boolean 
 // to an object instance.
 function convertFunctionToObject(evaluator: TypeEvaluator, type: Type) {
     if (isFunction(type) || isOverloadedFunction(type)) {
-        const objectType = evaluator.getObjectType();
-        if (objectType) {
-            return objectType;
-        }
+        return evaluator.getObjectType();
     }
 
     return type;
+}
+
+// Determines whether the expression refers to a variable that
+// is defined within the current scope or some outer scope.
+function isExpressionLocalVariable(evaluator: TypeEvaluator, node: ExpressionNode): boolean {
+    if (node.nodeType !== ParseNodeType.Name) {
+        return false;
+    }
+
+    const symbolWithScope = evaluator.lookUpSymbolRecursive(node, node.value, /* honorCodeFlow */ false);
+    if (!symbolWithScope) {
+        return false;
+    }
+
+    const currentScope = getScopeForNode(node);
+    return currentScope === symbolWithScope.scope;
 }

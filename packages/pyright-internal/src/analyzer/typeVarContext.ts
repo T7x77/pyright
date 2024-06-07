@@ -10,19 +10,21 @@
  */
 
 import { assert } from '../common/debug';
+import { getUnknownTypeForParamSpec } from './typeUtils';
 import {
     AnyType,
     ClassType,
     FunctionType,
     InScopePlaceholderScopeId,
-    isFunction,
-    maxTypeRecursionCount,
     TupleTypeArgument,
     Type,
     TypeCategory,
     TypeVarScopeId,
     TypeVarType,
-    WildcardTypeVarScopeId,
+    isAnyOrUnknown,
+    isFunction,
+    isTypeSame,
+    maxTypeRecursionCount,
 } from './types';
 
 // The maximum number of signature contexts that can be associated
@@ -30,8 +32,10 @@ import {
 // that can be captured by a ParamSpec (or multiple ParamSpecs).
 // We should never hit this limit in practice, but there are certain
 // pathological cases where we could, and we need to protect against
-// this so it doesn't completely exhaust memory.
-const maxSignatureContextCount = 64;
+// this so it doesn't completely exhaust memory. This was previously
+// set to 64, but we have seen cases where a library uses in excess
+// of 300 overloads on a single function.
+const maxSignatureContextCount = 1024;
 
 export interface TypeVarMapEntry {
     typeVar: TypeVarType;
@@ -72,6 +76,34 @@ export class TypeVarSignatureContext {
         }
 
         return newContext;
+    }
+
+    isSame(other: TypeVarSignatureContext) {
+        if (this._typeVarMap.size !== other._typeVarMap.size) {
+            return false;
+        }
+
+        function typesMatch(type1: Type | undefined, type2: Type | undefined) {
+            if (!type1 || !type2) {
+                return type1 === type2;
+            }
+
+            return isTypeSame(type1, type2);
+        }
+
+        let isSame = true;
+        this._typeVarMap.forEach((value, key) => {
+            const otherValue = other._typeVarMap.get(key);
+            if (
+                !otherValue ||
+                !typesMatch(value.narrowBound, otherValue.narrowBound) ||
+                !typesMatch(value.wideBound, otherValue.wideBound)
+            ) {
+                isSame = false;
+            }
+        });
+
+        return isSame;
     }
 
     isEmpty() {
@@ -124,6 +156,10 @@ export class TypeVarSignatureContext {
             return entry.narrowBound;
         }
 
+        if (isAnyOrUnknown(entry.narrowBound)) {
+            return getUnknownTypeForParamSpec();
+        }
+
         return undefined;
     }
 
@@ -131,10 +167,17 @@ export class TypeVarSignatureContext {
         reference: TypeVarType,
         narrowBound: Type | undefined,
         narrowBoundNoLiterals?: Type,
-        wideBound?: Type
+        wideBound?: Type,
+        tupleTypes?: TupleTypeArgument[]
     ) {
         const key = TypeVarType.getNameWithScope(reference);
-        this._typeVarMap.set(key, { typeVar: reference, narrowBound, narrowBoundNoLiterals, wideBound });
+        this._typeVarMap.set(key, {
+            typeVar: reference,
+            narrowBound,
+            narrowBoundNoLiterals,
+            wideBound,
+            tupleTypes,
+        });
     }
 
     getTupleTypeVar(reference: TypeVarType): TupleTypeArgument[] | undefined {
@@ -206,7 +249,6 @@ export class TypeVarSignatureContext {
         switch (type.category) {
             case TypeCategory.Unknown:
             case TypeCategory.Any:
-            case TypeCategory.None:
             case TypeCategory.TypeVar: {
                 return 0.5;
             }
@@ -275,11 +317,15 @@ export class TypeVarSignatureContext {
 }
 
 export class TypeVarContext {
+    static nextTypeVarContextId = 1;
+    private _id;
     private _solveForScopes: TypeVarScopeId[] | undefined;
     private _isLocked = false;
     private _signatureContexts: TypeVarSignatureContext[];
 
     constructor(solveForScopes?: TypeVarScopeId[] | TypeVarScopeId) {
+        this._id = TypeVarContext.nextTypeVarContextId++;
+
         if (Array.isArray(solveForScopes)) {
             this._solveForScopes = solveForScopes;
         } else if (solveForScopes !== undefined) {
@@ -340,6 +386,18 @@ export class TypeVarContext {
         }
     }
 
+    isSame(other: TypeVarContext) {
+        if (other._signatureContexts.length !== this._signatureContexts.length) {
+            return false;
+        }
+
+        return this._signatureContexts.every((context, index) => context.isSame(other._signatureContexts[index]));
+    }
+
+    getId() {
+        return this._id;
+    }
+
     // Returns the list of scopes this type var map is "solving".
     getSolveForScopes() {
         return this._solveForScopes;
@@ -357,12 +415,14 @@ export class TypeVarContext {
         return (
             scopeId !== undefined &&
             this._solveForScopes !== undefined &&
-            this._solveForScopes.some((s) => s === scopeId || s === WildcardTypeVarScopeId)
+            this._solveForScopes.some((s) => s === scopeId)
         );
     }
 
     setSolveForScopes(scopeIds: TypeVarScopeId[]) {
-        this._solveForScopes = scopeIds;
+        scopeIds.forEach((scopeId) => {
+            this.addSolveForScope(scopeId);
+        });
     }
 
     addSolveForScope(scopeId?: TypeVarScopeId | TypeVarScopeId[]) {
@@ -402,12 +462,13 @@ export class TypeVarContext {
         reference: TypeVarType,
         narrowBound: Type | undefined,
         narrowBoundNoLiterals?: Type,
-        wideBound?: Type
+        wideBound?: Type,
+        tupleTypes?: TupleTypeArgument[]
     ) {
         assert(!this._isLocked);
 
         return this._signatureContexts.forEach((context) => {
-            context.setTypeVarType(reference, narrowBound, narrowBoundNoLiterals, wideBound);
+            context.setTypeVarType(reference, narrowBound, narrowBoundNoLiterals, wideBound, tupleTypes);
         });
     }
 
@@ -438,12 +499,12 @@ export class TypeVarContext {
         return this._signatureContexts;
     }
 
-    doForEachSignatureContext(callback: (signature: TypeVarSignatureContext) => void) {
+    doForEachSignatureContext(callback: (signature: TypeVarSignatureContext, signatureIndex: number) => void) {
         const wasLocked = this.isLocked();
         this.unlock();
 
-        this.getSignatureContexts().forEach((signature) => {
-            callback(signature);
+        this.getSignatureContexts().forEach((signature, signatureIndex) => {
+            callback(signature, signatureIndex);
         });
 
         if (wasLocked) {

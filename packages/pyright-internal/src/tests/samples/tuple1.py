@@ -1,8 +1,11 @@
 # This sample file tests various aspects of type analysis for tuples.
 
 import os
-from typing import Callable
-from typing_extensions import TypeVarTuple, Unpack
+from typing import Any, Callable
+from typing_extensions import (  # pyright: ignore[reportMissingModuleSource]
+    TypeVarTuple,
+    Unpack,
+)
 
 Ts = TypeVarTuple("Ts")
 
@@ -174,7 +177,7 @@ def func13(
 
     v10 = d[0]
 
-    # This should generate one error.
+    # This should generate an error.
     v11 = d[1]
 
     # This should generate two errors.
@@ -185,10 +188,19 @@ def func13(
     v13[0]
 
     v14 = e[0]
-    reveal_type(v14, expected_text="int | str | float")
+    reveal_type(v14, expected_text="int")
 
-    v15 = f[0]
-    reveal_type(v15, expected_text="int | Union[*Ts@func13] | float")
+    v15 = e[1]
+    reveal_type(v15, expected_text="int | str | float")
+
+    v16 = f[0]
+    reveal_type(v16, expected_text="int")
+
+    v17 = f[1]
+    reveal_type(v17, expected_text="int | Union[*Ts@func13] | float")
+
+    v18 = f[-1]
+    reveal_type(v18, expected_text="int | Union[*Ts@func13] | float")
 
 
 def func14():
@@ -205,11 +217,56 @@ def func16(var: tuple[int, int]) -> str:
     raise NotImplementedError
 
 
-def func17(var: tuple[int, int, int]) -> str:
+def func17(var: tuple[int, ...]) -> str:
     raise NotImplementedError
 
 
-f: Callable[[tuple[int, ...]], str]
-f = func15
-f = func16
-f = func17
+f1: Callable[[tuple[int, ...]], str]
+
+# This should generate an error.
+f1 = func15
+
+# This should generate an error.
+f1 = func16
+
+f1 = func17
+
+
+def func18(a: tuple[int, *tuple[Any, ...], str], b: tuple[Any, ...]):
+    a1: tuple[int, str] = a
+    a2: tuple[int, int, str] = a
+    a3: tuple[int, int, str, str] = a
+    a4: tuple[int, *tuple[int, ...], str] = a
+
+    # This should generate an error.
+    a5: tuple[str, int, str, str] = a
+
+    # This should generate an error.
+    a6: tuple[int, int, str, int] = a
+
+    b1: tuple[()] = b
+    b2: tuple[int, int, str] = b
+    b3: tuple[int, *tuple[int, ...], str] = b
+
+
+def func19(a: tuple[int, ...], b: tuple[int, *tuple[int, ...]]):
+    a1: tuple[*tuple[int, ...]] = a
+
+    # This should generate an error.
+    a2: tuple[int, *tuple[int, ...]] = a
+
+    # This should generate an error.
+    a3: tuple[int, *tuple[int, ...], int] = a
+
+    # This should generate an error.
+    a4: tuple[*tuple[int, ...], int] = a
+
+    b1: tuple[int, ...] = b
+    b2: tuple[int, *tuple[int, ...]] = b
+    b3: tuple[*tuple[int, ...], int] = b
+
+    # This should generate an error.
+    b4: tuple[str, *tuple[int, ...]] = b
+
+    # This should generate an error.
+    b5: tuple[int, int, *tuple[int, ...]] = b

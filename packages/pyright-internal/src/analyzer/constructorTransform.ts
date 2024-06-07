@@ -13,11 +13,10 @@
 import { appendArray } from '../common/collectionUtils';
 import { DiagnosticAddendum } from '../common/diagnostic';
 import { DiagnosticRule } from '../common/diagnosticRules';
-import { Localizer } from '../localization/localize';
+import { LocMessage } from '../localization/localize';
 import { ArgumentCategory, ExpressionNode, ParameterCategory } from '../parser/parseNodes';
-import { getFileInfo } from './analyzerNodeInfo';
 import { createFunctionFromConstructor } from './constructors';
-import { getParameterListDetails, ParameterSource } from './parameterUtils';
+import { getParameterListDetails, ParameterKind } from './parameterUtils';
 import { Symbol, SymbolFlags } from './symbol';
 import { FunctionArgument, FunctionResult, TypeEvaluator } from './typeEvaluatorTypes';
 import {
@@ -40,6 +39,8 @@ import {
     getTypeVarScopeId,
     lookUpObjectMember,
     makeInferenceContext,
+    MemberAccessFlags,
+    UniqueSignatureTracker,
 } from './typeUtils';
 import { TypeVarContext } from './typeVarContext';
 
@@ -56,10 +57,11 @@ export function applyConstructorTransform(
     errorNode: ExpressionNode,
     argList: FunctionArgument[],
     classType: ClassType,
-    result: FunctionResult
+    result: FunctionResult,
+    signatureTracker: UniqueSignatureTracker | undefined
 ): FunctionResult {
     if (classType.details.fullName === 'functools.partial') {
-        return applyPartialTransform(evaluator, errorNode, argList, result);
+        return applyPartialTransform(evaluator, errorNode, argList, result, signatureTracker);
     }
 
     // By default, return the result unmodified.
@@ -71,14 +73,15 @@ function applyPartialTransform(
     evaluator: TypeEvaluator,
     errorNode: ExpressionNode,
     argList: FunctionArgument[],
-    result: FunctionResult
+    result: FunctionResult,
+    signatureTracker: UniqueSignatureTracker | undefined
 ): FunctionResult {
     // We assume that the normal return result is a functools.partial class instance.
     if (!isClassInstance(result.returnType) || result.returnType.details.fullName !== 'functools.partial') {
         return result;
     }
 
-    const callMemberResult = lookUpObjectMember(result.returnType, '__call__');
+    const callMemberResult = lookUpObjectMember(result.returnType, '__call__', MemberAccessFlags.SkipInstanceMembers);
     if (!callMemberResult || !isTypeSame(convertToInstance(callMemberResult.classType), result.returnType)) {
         return result;
     }
@@ -92,15 +95,21 @@ function applyPartialTransform(
         return result;
     }
 
-    const origFunctionTypeResult = evaluator.getTypeOfArgument(argList[0]);
+    const origFunctionTypeResult = evaluator.getTypeOfArgument(
+        argList[0],
+        /* inferenceContext */ undefined,
+        signatureTracker
+    );
     let origFunctionType = origFunctionTypeResult.type;
+    const origFunctionTypeConcrete = evaluator.makeTopLevelTypeVarsConcrete(origFunctionType);
 
-    if (isTypeVar(origFunctionType)) {
-        origFunctionType = evaluator.makeTopLevelTypeVarsConcrete(origFunctionType);
-    }
+    if (isInstantiableClass(origFunctionTypeConcrete)) {
+        const constructor = createFunctionFromConstructor(
+            evaluator,
+            origFunctionTypeConcrete,
+            isTypeVar(origFunctionType) ? convertToInstance(origFunctionType) : undefined
+        );
 
-    if (isInstantiableClass(origFunctionType)) {
-        const constructor = createFunctionFromConstructor(evaluator, origFunctionType);
         if (constructor) {
             origFunctionType = constructor;
         }
@@ -129,7 +138,7 @@ function applyPartialTransform(
 
         // Create a new copy of the functools.partial class that overrides the __call__ method.
         const newPartialClass = ClassType.cloneForSymbolTableUpdate(result.returnType);
-        newPartialClass.details.fields.set(
+        ClassType.getSymbolTable(newPartialClass).set(
             '__call__',
             Symbol.createWithType(SymbolFlags.ClassMember, transformResult.returnType)
         );
@@ -168,9 +177,8 @@ function applyPartialTransform(
         if (applicableOverloads.length === 0) {
             if (sawArgErrors) {
                 evaluator.addDiagnostic(
-                    getFileInfo(errorNode).diagnosticRuleSet.reportGeneralTypeIssues,
-                    DiagnosticRule.reportGeneralTypeIssues,
-                    Localizer.Diagnostic.noOverload().format({
+                    DiagnosticRule.reportCallIssue,
+                    LocMessage.noOverload().format({
                         name: origFunctionType.overloads[0].details.name,
                     }),
                     errorNode
@@ -195,7 +203,7 @@ function applyPartialTransform(
             );
         }
 
-        newPartialClass.details.fields.set(
+        ClassType.getSymbolTable(newPartialClass).set(
             '__call__',
             Symbol.createWithType(SymbolFlags.ClassMember, synthesizedCallType)
         );
@@ -238,7 +246,7 @@ function applyPartialTransformToFunction(
             // Does this positional argument map to a positional parameter?
             if (
                 argIndex >= paramListDetails.params.length ||
-                paramListDetails.params[argIndex].source === ParameterSource.KeywordOnly
+                paramListDetails.params[argIndex].kind === ParameterKind.Keyword
             ) {
                 if (paramListDetails.argsIndex !== undefined) {
                     const paramType = FunctionType.getEffectiveParameterType(
@@ -256,9 +264,8 @@ function applyPartialTransformToFunction(
                     if (!evaluator.assignType(paramType, argTypeResult.type, diag, typeVarContext)) {
                         if (errorNode) {
                             evaluator.addDiagnostic(
-                                getFileInfo(errorNode).diagnosticRuleSet.reportGeneralTypeIssues,
-                                DiagnosticRule.reportGeneralTypeIssues,
-                                Localizer.Diagnostic.argAssignmentParamFunction().format({
+                                DiagnosticRule.reportArgumentType,
+                                LocMessage.argAssignmentParamFunction().format({
                                     argType: evaluator.printType(argTypeResult.type),
                                     paramType: evaluator.printType(paramType),
                                     functionName: origFunctionType.details.name,
@@ -275,11 +282,10 @@ function applyPartialTransformToFunction(
                     if (!reportedPositionalError) {
                         if (errorNode) {
                             evaluator.addDiagnostic(
-                                getFileInfo(errorNode).diagnosticRuleSet.reportGeneralTypeIssues,
-                                DiagnosticRule.reportGeneralTypeIssues,
+                                DiagnosticRule.reportCallIssue,
                                 paramListDetails.positionParamCount === 1
-                                    ? Localizer.Diagnostic.argPositionalExpectedOne()
-                                    : Localizer.Diagnostic.argPositionalExpectedCount().format({
+                                    ? LocMessage.argPositionalExpectedOne()
+                                    : LocMessage.argPositionalExpectedCount().format({
                                           expected: paramListDetails.positionParamCount,
                                       }),
                                 arg.valueExpression ?? errorNode
@@ -304,9 +310,8 @@ function applyPartialTransformToFunction(
                 if (!evaluator.assignType(paramType, argTypeResult.type, diag, typeVarContext)) {
                     if (errorNode) {
                         evaluator.addDiagnostic(
-                            getFileInfo(errorNode).diagnosticRuleSet.reportGeneralTypeIssues,
-                            DiagnosticRule.reportGeneralTypeIssues,
-                            Localizer.Diagnostic.argAssignmentParamFunction().format({
+                            DiagnosticRule.reportArgumentType,
+                            LocMessage.argAssignmentParamFunction().format({
                                 argType: evaluator.printType(argTypeResult.type),
                                 paramType: evaluator.printType(paramType),
                                 functionName: origFunctionType.details.name,
@@ -324,8 +329,7 @@ function applyPartialTransformToFunction(
             }
         } else {
             const matchingParam = paramListDetails.params.find(
-                (paramInfo) =>
-                    paramInfo.param.name === arg.name?.value && paramInfo.source !== ParameterSource.PositionOnly
+                (paramInfo) => paramInfo.param.name === arg.name?.value && paramInfo.kind !== ParameterKind.Positional
             );
 
             if (!matchingParam) {
@@ -333,9 +337,8 @@ function applyPartialTransformToFunction(
                 if (paramListDetails.kwargsIndex === undefined) {
                     if (errorNode) {
                         evaluator.addDiagnostic(
-                            getFileInfo(errorNode).diagnosticRuleSet.reportGeneralTypeIssues,
-                            DiagnosticRule.reportGeneralTypeIssues,
-                            Localizer.Diagnostic.paramNameMissing().format({ name: arg.name.value }),
+                            DiagnosticRule.reportCallIssue,
+                            LocMessage.paramNameMissing().format({ name: arg.name.value }),
                             arg.name
                         );
                     }
@@ -356,9 +359,8 @@ function applyPartialTransformToFunction(
                     if (!evaluator.assignType(paramType, argTypeResult.type, diag, typeVarContext)) {
                         if (errorNode) {
                             evaluator.addDiagnostic(
-                                getFileInfo(errorNode).diagnosticRuleSet.reportGeneralTypeIssues,
-                                DiagnosticRule.reportGeneralTypeIssues,
-                                Localizer.Diagnostic.argAssignmentParamFunction().format({
+                                DiagnosticRule.reportArgumentType,
+                                LocMessage.argAssignmentParamFunction().format({
                                     argType: evaluator.printType(argTypeResult.type),
                                     paramType: evaluator.printType(paramType),
                                     functionName: origFunctionType.details.name,
@@ -378,9 +380,8 @@ function applyPartialTransformToFunction(
                 if (paramMap.has(paramName)) {
                     if (errorNode) {
                         evaluator.addDiagnostic(
-                            getFileInfo(errorNode).diagnosticRuleSet.reportGeneralTypeIssues,
-                            DiagnosticRule.reportGeneralTypeIssues,
-                            Localizer.Diagnostic.paramAlreadyAssigned().format({ name: arg.name.value }),
+                            DiagnosticRule.reportCallIssue,
+                            LocMessage.paramAlreadyAssigned().format({ name: arg.name.value }),
                             arg.name
                         );
                     }
@@ -398,9 +399,8 @@ function applyPartialTransformToFunction(
                     if (!evaluator.assignType(paramType, argTypeResult.type, diag, typeVarContext)) {
                         if (errorNode) {
                             evaluator.addDiagnostic(
-                                getFileInfo(errorNode).diagnosticRuleSet.reportGeneralTypeIssues,
-                                DiagnosticRule.reportGeneralTypeIssues,
-                                Localizer.Diagnostic.argAssignmentParamFunction().format({
+                                DiagnosticRule.reportArgumentType,
+                                LocMessage.argAssignmentParamFunction().format({
                                     argType: evaluator.printType(argTypeResult.type),
                                     paramType: evaluator.printType(paramType),
                                     functionName: origFunctionType.details.name,
@@ -474,7 +474,7 @@ function applyPartialTransformToFunction(
     });
 
     newCallMemberType.details.declaredReturnType = specializedFunctionType.details.declaredReturnType
-        ? FunctionType.getSpecializedReturnType(specializedFunctionType)
+        ? FunctionType.getEffectiveReturnType(specializedFunctionType)
         : specializedFunctionType.inferredReturnType;
     newCallMemberType.details.declaration = partialCallMemberType.details.declaration;
     newCallMemberType.details.typeVarScopeId = specializedFunctionType.details.typeVarScopeId;

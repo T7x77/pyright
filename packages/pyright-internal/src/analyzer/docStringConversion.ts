@@ -59,7 +59,7 @@ const LeadingAsteriskListRegExp = /^(\s*)\*\s/;
 const LeadingNumberListRegExp = /^(\s*)\d+\.\s/;
 const LeadingAsteriskRegExp = /^(\s+\* )(.*)$/;
 const SpaceDotDotRegExp = /^\s*\.\. /;
-const DirectiveLikeRegExp = /^\s*\.\.\s+(\w+)::\s*(.*)$/;
+const DirectiveLikeRegExp = /^\s*\.\.\s+(.*)::\s*(.*)$/;
 const DoctestRegExp = / *>>> /;
 const DirectivesExtraNewlineRegExp = /^\s*:(param|arg|type|return|rtype|raise|except|var|ivar|cvar|copyright|license)/;
 const epyDocFieldTokensRegExp = /^\.[\s\t]+(@\w)/gm; // cv2 has leading '.' http://epydoc.sourceforge.net/manual-epytext.html
@@ -588,8 +588,7 @@ class DocStringConverter {
         }
 
         // catch-all for styles except reST
-        const hasArguments =
-            !line?.endsWith(':') && !line?.endsWith('::') && !!line.match(/^\s*.*?\w+(\s*\(.*?\))*\s*:\s*\w+/g);
+        const hasArguments = !line?.endsWith(':') && !line?.endsWith('::') && !!line.match(/.*?\s*:\s*(.+)/gu);
 
         // reSt params. Attempt to put directives lines into their own paragraphs.
         const restDirective = DirectivesExtraNewlineRegExp.test(line); //line.match(/^\s*:param/);
@@ -800,6 +799,11 @@ class DocStringConverter {
                 this._appendLine(directive);
                 this._appendLine('```');
                 this._appendLine();
+            } else if (directiveType === 'code-block') {
+                this._appendDirectiveBlock = true;
+                this._beginMinIndentCodeBlock(this._parseLiteralBlock);
+                this._eatLine();
+                return;
             }
         }
 

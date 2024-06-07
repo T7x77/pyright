@@ -7,14 +7,15 @@
  */
 
 import { BackgroundAnalysisRunner } from './backgroundAnalysis';
+import { ServiceProvider } from './common/serviceProvider';
 import { run } from './nodeServer';
 import { PyrightServer } from './server';
 
-export function main() {
+export function main(maxWorkers: number) {
     run(
-        (conn) => new PyrightServer(conn),
+        (conn) => new PyrightServer(conn, maxWorkers),
         () => {
-            const runner = new BackgroundAnalysisRunner();
+            const runner = new BackgroundAnalysisRunner(new ServiceProvider());
             runner.start();
         }
     );

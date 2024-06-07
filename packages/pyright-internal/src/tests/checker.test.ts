@@ -10,7 +10,8 @@
  */
 
 import { ConfigOptions } from '../common/configOptions';
-import { PythonVersion } from '../common/pythonVersion';
+import { pythonVersion3_10, pythonVersion3_8, pythonVersion3_9 } from '../common/pythonVersion';
+import { Uri } from '../common/uri/uri';
 import * as TestUtils from './testUtils';
 
 test('BadToken1', () => {
@@ -34,7 +35,7 @@ test('CircularBaseClass', () => {
 });
 
 test('Private1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     // By default, optional diagnostics are ignored.
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['private1.py'], configOptions);
@@ -47,7 +48,7 @@ test('Private1', () => {
 });
 
 test('Constant1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     // By default, optional diagnostics are ignored.
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['constant1.py'], configOptions);
@@ -168,13 +169,13 @@ test('With3', () => {
 });
 
 test('With4', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
-    configOptions.defaultPythonVersion = PythonVersion.V3_8;
+    configOptions.defaultPythonVersion = pythonVersion3_8;
     const analysisResults1 = TestUtils.typeAnalyzeSampleFiles(['with4.py'], configOptions);
     TestUtils.validateResults(analysisResults1, 4);
 
-    configOptions.defaultPythonVersion = PythonVersion.V3_9;
+    configOptions.defaultPythonVersion = pythonVersion3_9;
     const analysisResults2 = TestUtils.typeAnalyzeSampleFiles(['with4.py'], configOptions);
     TestUtils.validateResults(analysisResults2, 0);
 });
@@ -216,7 +217,7 @@ test('Mro4', () => {
 });
 
 test('DefaultInitializer1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     // By default, the reportCallInDefaultInitializer is disabled.
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['defaultInitializer1.py'], configOptions);
@@ -229,7 +230,7 @@ test('DefaultInitializer1', () => {
 });
 
 test('UnnecessaryIsInstance1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['unnecessaryIsInstance1.py'], configOptions);
     TestUtils.validateResults(analysisResults, 1);
@@ -241,7 +242,7 @@ test('UnnecessaryIsInstance1', () => {
 });
 
 test('UnnecessaryIsSubclass1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['unnecessaryIsSubclass1.py'], configOptions);
     TestUtils.validateResults(analysisResults, 0);
@@ -253,7 +254,7 @@ test('UnnecessaryIsSubclass1', () => {
 });
 
 test('UnnecessaryCast1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['unnecessaryCast1.py'], configOptions);
     TestUtils.validateResults(analysisResults, 0);
@@ -265,7 +266,7 @@ test('UnnecessaryCast1', () => {
 });
 
 test('UnnecessaryContains1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['unnecessaryContains1.py'], configOptions);
     TestUtils.validateResults(analysisResults, 0);
@@ -277,7 +278,7 @@ test('UnnecessaryContains1', () => {
 });
 
 test('TypeIgnore1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['typeIgnore1.py'], configOptions);
     TestUtils.validateResults(analysisResults, 0);
@@ -289,7 +290,7 @@ test('TypeIgnore1', () => {
 });
 
 test('TypeIgnore2', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['typeIgnore2.py'], configOptions);
     TestUtils.validateResults(analysisResults, 0);
@@ -301,7 +302,7 @@ test('TypeIgnore2', () => {
 });
 
 test('TypeIgnore3', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['typeIgnore3.py'], configOptions);
     TestUtils.validateResults(analysisResults, 0);
@@ -313,7 +314,7 @@ test('TypeIgnore3', () => {
 });
 
 test('TypeIgnore4', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['typeIgnore4.py'], configOptions);
     TestUtils.validateResults(analysisResults, 0);
@@ -324,7 +325,7 @@ test('TypeIgnore4', () => {
 });
 
 test('TypeIgnore5', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['typeIgnore5.py'], configOptions);
     TestUtils.validateResults(analysisResults, 0);
@@ -335,14 +336,14 @@ test('TypeIgnore5', () => {
 });
 
 test('PyrightIgnore1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['pyrightIgnore1.py'], configOptions);
     TestUtils.validateResults(analysisResults, 1);
 });
 
 test('PyrightIgnore2', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['pyrightIgnore2.py'], configOptions);
     TestUtils.validateResults(analysisResults, 2);
@@ -353,14 +354,14 @@ test('PyrightIgnore2', () => {
 });
 
 test('PyrightComment1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     const analysisResults = TestUtils.typeAnalyzeSampleFiles(['pyrightComment1.py'], configOptions);
     TestUtils.validateResults(analysisResults, 9);
 });
 
 test('DuplicateImports1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     // By default, optional diagnostics are ignored.
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['duplicateImports1.py'], configOptions);
@@ -373,7 +374,7 @@ test('DuplicateImports1', () => {
 });
 
 test('ParamNames1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['paramNames1.py'], configOptions);
     TestUtils.validateResults(analysisResults, 0, 7);
@@ -423,7 +424,7 @@ test('DuplicateDeclaration2', () => {
 });
 
 test('Strings1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
     const analysisResults1 = TestUtils.typeAnalyzeSampleFiles(['strings1.py'], configOptions);
     TestUtils.validateResults(analysisResults1, 0);
 
@@ -433,7 +434,7 @@ test('Strings1', () => {
 });
 
 test('UnusedExpression1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     // By default, this is a warning.
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['unusedExpression1.py'], configOptions);
@@ -451,7 +452,7 @@ test('UnusedExpression1', () => {
 });
 
 test('UnusedImport1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     // Enabled it
     configOptions.diagnosticRuleSet.reportUnusedImport = 'warning';
@@ -470,7 +471,7 @@ test('UnusedImport1', () => {
 });
 
 test('UninitializedVariable1', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     // By default, this is off.
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['uninitializedVariable1.py'], configOptions);
@@ -483,7 +484,7 @@ test('UninitializedVariable1', () => {
 });
 
 test('UninitializedVariable2', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     // By default, this is off.
     let analysisResults = TestUtils.typeAnalyzeSampleFiles(['uninitializedVariable2.py'], configOptions);
@@ -495,43 +496,65 @@ test('UninitializedVariable2', () => {
     TestUtils.validateResults(analysisResults, 2);
 });
 
-test('RegionComments1', () => {
-    const analysisResults = TestUtils.typeAnalyzeSampleFiles(['regionComments1.py']);
+test('Deprecated1', () => {
+    const configOptions = new ConfigOptions(Uri.empty());
 
-    TestUtils.validateResults(analysisResults, 2);
+    configOptions.defaultPythonVersion = pythonVersion3_8;
+    const analysisResults1 = TestUtils.typeAnalyzeSampleFiles(['deprecated1.py'], configOptions);
+    TestUtils.validateResults(analysisResults1, 0, 0, 0, undefined, undefined, 0);
+
+    configOptions.defaultPythonVersion = pythonVersion3_9;
+    const analysisResults2 = TestUtils.typeAnalyzeSampleFiles(['deprecated1.py'], configOptions);
+    TestUtils.validateResults(analysisResults2, 0, 0, 0, undefined, undefined, 0);
+
+    configOptions.defaultPythonVersion = pythonVersion3_10;
+    const analysisResults3 = TestUtils.typeAnalyzeSampleFiles(['deprecated1.py'], configOptions);
+    TestUtils.validateResults(analysisResults3, 0, 0, 0, undefined, undefined, 0);
+
+    // Now enable the deprecateTypingAliases setting.
+    configOptions.diagnosticRuleSet.deprecateTypingAliases = true;
+
+    configOptions.defaultPythonVersion = pythonVersion3_8;
+    const analysisResults4 = TestUtils.typeAnalyzeSampleFiles(['deprecated1.py'], configOptions);
+    TestUtils.validateResults(analysisResults4, 0, 0, 0, undefined, undefined, 0);
+
+    configOptions.defaultPythonVersion = pythonVersion3_9;
+    const analysisResults5 = TestUtils.typeAnalyzeSampleFiles(['deprecated1.py'], configOptions);
+    TestUtils.validateResults(analysisResults5, 0, 0, 0, undefined, undefined, 45);
+
+    configOptions.defaultPythonVersion = pythonVersion3_10;
+    const analysisResults6 = TestUtils.typeAnalyzeSampleFiles(['deprecated1.py'], configOptions);
+    TestUtils.validateResults(analysisResults6, 0, 0, 0, undefined, undefined, 49);
+
+    // Now change reportDeprecated to emit an error.
+    configOptions.diagnosticRuleSet.reportDeprecated = 'error';
+
+    configOptions.defaultPythonVersion = pythonVersion3_8;
+    const analysisResults7 = TestUtils.typeAnalyzeSampleFiles(['deprecated1.py'], configOptions);
+    TestUtils.validateResults(analysisResults7, 0, 0, 0, undefined, undefined, 0);
+
+    configOptions.defaultPythonVersion = pythonVersion3_9;
+    const analysisResults8 = TestUtils.typeAnalyzeSampleFiles(['deprecated1.py'], configOptions);
+    TestUtils.validateResults(analysisResults8, 45, 0, 0, undefined, undefined, 0);
+
+    configOptions.defaultPythonVersion = pythonVersion3_10;
+    const analysisResults9 = TestUtils.typeAnalyzeSampleFiles(['deprecated1.py'], configOptions);
+    TestUtils.validateResults(analysisResults9, 49, 0, 0, undefined, undefined, 0);
 });
 
-// For now, this functionality is disabled.
-
-// test('Deprecated1', () => {
-//     const configOptions = new ConfigOptions('.');
-
-//     configOptions.defaultPythonVersion = PythonVersion.V3_8;
-//     const analysisResults1 = TestUtils.typeAnalyzeSampleFiles(['deprecated1.py'], configOptions);
-//     TestUtils.validateResults(analysisResults1, 0, 0, 0, 0, 0);
-
-//     configOptions.defaultPythonVersion = PythonVersion.V3_9;
-//     const analysisResults2 = TestUtils.typeAnalyzeSampleFiles(['deprecated1.py'], configOptions);
-//     TestUtils.validateResults(analysisResults2, 0, 0, 0, 0, 11);
-
-//     configOptions.defaultPythonVersion = PythonVersion.V3_10;
-//     const analysisResults3 = TestUtils.typeAnalyzeSampleFiles(['deprecated1.py'], configOptions);
-//     TestUtils.validateResults(analysisResults3, 0, 0, 0, 0, 13);
-// });
-
 test('Deprecated2', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     const analysisResults1 = TestUtils.typeAnalyzeSampleFiles(['deprecated2.py'], configOptions);
-    TestUtils.validateResults(analysisResults1, 0, 0, 0, undefined, undefined, 6);
+    TestUtils.validateResults(analysisResults1, 0, 0, 0, undefined, undefined, 13);
 
     configOptions.diagnosticRuleSet.reportDeprecated = 'error';
     const analysisResults2 = TestUtils.typeAnalyzeSampleFiles(['deprecated2.py'], configOptions);
-    TestUtils.validateResults(analysisResults2, 6);
+    TestUtils.validateResults(analysisResults2, 13);
 });
 
 test('Deprecated3', () => {
-    const configOptions = new ConfigOptions('.');
+    const configOptions = new ConfigOptions(Uri.empty());
 
     const analysisResults1 = TestUtils.typeAnalyzeSampleFiles(['deprecated3.py'], configOptions);
     TestUtils.validateResults(analysisResults1, 0, 0, 0, undefined, undefined, 5);
@@ -539,4 +562,37 @@ test('Deprecated3', () => {
     configOptions.diagnosticRuleSet.reportDeprecated = 'error';
     const analysisResults2 = TestUtils.typeAnalyzeSampleFiles(['deprecated3.py'], configOptions);
     TestUtils.validateResults(analysisResults2, 5);
+});
+
+test('Deprecated4', () => {
+    const configOptions = new ConfigOptions(Uri.empty());
+
+    const analysisResults1 = TestUtils.typeAnalyzeSampleFiles(['deprecated4.py'], configOptions);
+    TestUtils.validateResults(analysisResults1, 0, 0, 0, undefined, undefined, 6);
+
+    configOptions.diagnosticRuleSet.reportDeprecated = 'error';
+    const analysisResults2 = TestUtils.typeAnalyzeSampleFiles(['deprecated4.py'], configOptions);
+    TestUtils.validateResults(analysisResults2, 6);
+});
+
+test('Deprecated5', () => {
+    const configOptions = new ConfigOptions(Uri.empty());
+
+    const analysisResults1 = TestUtils.typeAnalyzeSampleFiles(['deprecated5.py'], configOptions);
+    TestUtils.validateResults(analysisResults1, 0, 0, 0, undefined, undefined, 2);
+
+    configOptions.diagnosticRuleSet.reportDeprecated = 'error';
+    const analysisResults2 = TestUtils.typeAnalyzeSampleFiles(['deprecated5.py'], configOptions);
+    TestUtils.validateResults(analysisResults2, 2);
+});
+
+test('Deprecated6', () => {
+    const configOptions = new ConfigOptions(Uri.empty());
+
+    const analysisResults1 = TestUtils.typeAnalyzeSampleFiles(['deprecated6.py'], configOptions);
+    TestUtils.validateResults(analysisResults1, 0, 0, 0, undefined, undefined, 3);
+
+    configOptions.diagnosticRuleSet.reportDeprecated = 'error';
+    const analysisResults2 = TestUtils.typeAnalyzeSampleFiles(['deprecated6.py'], configOptions);
+    TestUtils.validateResults(analysisResults2, 3);
 });

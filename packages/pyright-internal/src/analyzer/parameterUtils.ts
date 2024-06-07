@@ -12,13 +12,18 @@ import {
     ClassType,
     FunctionParameter,
     FunctionType,
+    isAnyOrUnknown,
     isClassInstance,
+    isParamSpec,
     isPositionOnlySeparator,
+    isTypeSame,
+    isTypeVar,
     isUnpackedClass,
     isVariadicTypeVar,
     Type,
+    TypeVarType,
 } from './types';
-import { partiallySpecializeType } from './typeUtils';
+import { doForEachSubtype, partiallySpecializeType } from './typeUtils';
 
 export function isTypedKwargs(param: FunctionParameter): boolean {
     return (
@@ -30,10 +35,10 @@ export function isTypedKwargs(param: FunctionParameter): boolean {
     );
 }
 
-export enum ParameterSource {
-    PositionOnly,
-    PositionOrKeyword,
-    KeywordOnly,
+export enum ParameterKind {
+    Positional,
+    Standard,
+    Keyword,
 }
 
 export interface VirtualParameterDetails {
@@ -41,7 +46,7 @@ export interface VirtualParameterDetails {
     type: Type;
     defaultArgType?: Type | undefined;
     index: number;
-    source: ParameterSource;
+    kind: ParameterKind;
 }
 
 export interface ParameterListDetails {
@@ -62,6 +67,11 @@ export interface ParameterListDetails {
     hasUnpackedVariadicTypeVar: boolean;
     hasUnpackedTypedDict: boolean;
     unpackedKwargsTypedDictType?: ClassType;
+    paramSpec?: TypeVarType;
+}
+
+export function firstParametersExcludingSelf(type: FunctionType): FunctionParameter | undefined {
+    return type.details.parameters.find((p) => !(isTypeVar(p.type) && p.type.details.isSynthesizedSelf));
 }
 
 // Examines the input parameters within a function signature and creates a
@@ -105,10 +115,6 @@ export function getParameterListDetails(type: FunctionType): ParameterListDetail
         }
     }
 
-    if (positionOnlyIndex >= 0) {
-        result.firstPositionOrKeywordIndex = positionOnlyIndex;
-    }
-
     for (let i = 0; i < positionOnlyIndex; i++) {
         if (type.details.parameters[i].hasDefault) {
             break;
@@ -124,20 +130,20 @@ export function getParameterListDetails(type: FunctionType): ParameterListDetail
         index: number,
         typeOverride?: Type,
         defaultArgTypeOverride?: Type,
-        sourceOverride?: ParameterSource
+        sourceOverride?: ParameterKind
     ) => {
         if (param.name) {
-            let source: ParameterSource;
+            let kind: ParameterKind;
             if (sourceOverride !== undefined) {
-                source = sourceOverride;
+                kind = sourceOverride;
             } else if (param.category === ParameterCategory.ArgsList) {
-                source = ParameterSource.PositionOnly;
+                kind = ParameterKind.Positional;
             } else if (sawKeywordOnlySeparator) {
-                source = ParameterSource.KeywordOnly;
+                kind = ParameterKind.Keyword;
             } else if (positionOnlyIndex >= 0 && index < positionOnlyIndex) {
-                source = ParameterSource.PositionOnly;
+                kind = ParameterKind.Positional;
             } else {
-                source = ParameterSource.PositionOrKeyword;
+                kind = ParameterKind.Standard;
             }
 
             result.params.push({
@@ -145,7 +151,7 @@ export function getParameterListDetails(type: FunctionType): ParameterListDetail
                 index,
                 type: typeOverride ?? FunctionType.getEffectiveParameterType(type, index),
                 defaultArgType: defaultArgTypeOverride,
-                source,
+                kind,
             });
         }
     };
@@ -182,7 +188,7 @@ export function getParameterListDetails(type: FunctionType): ParameterListDetail
                         index,
                         tupleArg.type,
                         /* defaultArgTypeOverride */ undefined,
-                        ParameterSource.PositionOnly
+                        ParameterKind.Positional
                     );
 
                     if (category === ParameterCategory.Simple) {
@@ -237,7 +243,7 @@ export function getParameterListDetails(type: FunctionType): ParameterListDetail
                 }
 
                 const typedDictType = paramType;
-                paramType.details.typedDictEntries.forEach((entry, name) => {
+                paramType.details.typedDictEntries.knownItems.forEach((entry, name) => {
                     const specializedParamType = partiallySpecializeType(entry.valueType, typedDictType);
 
                     addVirtualParameter(
@@ -252,6 +258,22 @@ export function getParameterListDetails(type: FunctionType): ParameterListDetail
                         specializedParamType
                     );
                 });
+
+                if (paramType.details.typedDictEntries.extraItems) {
+                    addVirtualParameter(
+                        {
+                            category: ParameterCategory.KwargsDict,
+                            name: 'kwargs',
+                            type: paramType.details.typedDictEntries.extraItems.valueType,
+                            hasDeclaredType: true,
+                            hasDefault: false,
+                        },
+                        index,
+                        paramType.details.typedDictEntries.extraItems.valueType
+                    );
+
+                    result.kwargsIndex = result.params.length - 1;
+                }
 
                 result.hasUnpackedTypedDict = true;
                 result.unpackedKwargsTypedDictType = paramType;
@@ -282,5 +304,84 @@ export function getParameterListDetails(type: FunctionType): ParameterListDetail
         }
     });
 
+    // If the signature ends in `*args: P.args, **kwargs: P.kwargs`,
+    // extract the ParamSpec P.
+    result.paramSpec = FunctionType.getParamSpecFromArgsKwargs(type);
+
+    result.firstPositionOrKeywordIndex = result.params.findIndex((p) => p.kind !== ParameterKind.Positional);
+    if (result.firstPositionOrKeywordIndex < 0) {
+        result.firstPositionOrKeywordIndex = result.params.length;
+    }
+
     return result;
+}
+
+// Returns true if the type of the argument type is "*args: P.args" or
+// "*args: Any". Both of these match a parameter of type "*args: P.args".
+export function isParamSpecArgsArgument(paramSpec: TypeVarType, argType: Type) {
+    let isCompatible = true;
+
+    doForEachSubtype(argType, (argSubtype) => {
+        if (
+            isParamSpec(argSubtype) &&
+            argSubtype.paramSpecAccess === 'args' &&
+            isTypeSame(argSubtype, paramSpec, { ignoreTypeFlags: true })
+        ) {
+            return;
+        }
+
+        if (
+            isClassInstance(argSubtype) &&
+            argSubtype.tupleTypeArguments &&
+            argSubtype.tupleTypeArguments.length === 1 &&
+            argSubtype.tupleTypeArguments[0].isUnbounded &&
+            isAnyOrUnknown(argSubtype.tupleTypeArguments[0].type)
+        ) {
+            return;
+        }
+
+        if (isAnyOrUnknown(argSubtype)) {
+            return;
+        }
+
+        isCompatible = false;
+    });
+
+    return isCompatible;
+}
+
+// Returns true if the type of the argument type is "**kwargs: P.kwargs" or
+// "*kwargs: Any". Both of these match a parameter of type "*kwargs: P.kwargs".
+export function isParamSpecKwargsArgument(paramSpec: TypeVarType, argType: Type) {
+    let isCompatible = true;
+
+    doForEachSubtype(argType, (argSubtype) => {
+        if (
+            isParamSpec(argSubtype) &&
+            argSubtype.paramSpecAccess === 'kwargs' &&
+            isTypeSame(argSubtype, paramSpec, { ignoreTypeFlags: true })
+        ) {
+            return;
+        }
+
+        if (
+            isClassInstance(argSubtype) &&
+            ClassType.isBuiltIn(argSubtype, 'dict') &&
+            argSubtype.typeArguments &&
+            argSubtype.typeArguments.length === 2 &&
+            isClassInstance(argSubtype.typeArguments[0]) &&
+            ClassType.isBuiltIn(argSubtype.typeArguments[0], 'str') &&
+            isAnyOrUnknown(argSubtype.typeArguments[1])
+        ) {
+            return;
+        }
+
+        if (isAnyOrUnknown(argSubtype)) {
+            return;
+        }
+
+        isCompatible = false;
+    });
+
+    return isCompatible;
 }

@@ -13,7 +13,12 @@
 import { CancellationToken } from 'vscode-languageserver';
 
 import { getFileInfo } from '../analyzer/analyzerNodeInfo';
-import { Declaration, DeclarationType, isFunctionDeclaration } from '../analyzer/declaration';
+import {
+    Declaration,
+    DeclarationType,
+    isFunctionDeclaration,
+    isUnresolvedAliasDeclaration,
+} from '../analyzer/declaration';
 import * as ParseTreeUtils from '../analyzer/parseTreeUtils';
 import { SourceMapper, isStubFile } from '../analyzer/sourceMapper';
 import { TypeEvaluator } from '../analyzer/typeEvaluatorTypes';
@@ -22,11 +27,13 @@ import { TypeCategory, isOverloadedFunction } from '../analyzer/types';
 import { throwIfCancellationRequested } from '../common/cancellationUtils';
 import { appendArray } from '../common/collectionUtils';
 import { isDefined } from '../common/core';
-import { DeclarationUseCase, Extensions, ProgramView } from '../common/extensibility';
+import { ProgramView, ServiceProvider } from '../common/extensibility';
 import { convertPositionToOffset } from '../common/positionUtils';
+import { ServiceKeys } from '../common/serviceKeys';
 import { DocumentRange, Position, rangesAreEqual } from '../common/textRange';
+import { Uri } from '../common/uri/uri';
 import { ParseNode, ParseNodeType } from '../parser/parseNodes';
-import { ParseResults } from '../parser/parser';
+import { ParseFileResults } from '../parser/parser';
 
 export enum DefinitionFilter {
     All = 'all',
@@ -49,13 +56,15 @@ export function addDeclarationsToDefinitions(
             allowExternallyHiddenAccess: true,
         });
 
-        if (!resolvedDecl || !resolvedDecl.path) {
+        if (!resolvedDecl || resolvedDecl.uri.isEmpty()) {
             return;
         }
 
         // If the decl is an unresolved import, skip it.
-        if (resolvedDecl.type === DeclarationType.Alias && resolvedDecl.isUnresolved) {
-            return;
+        if (resolvedDecl.type === DeclarationType.Alias) {
+            if (resolvedDecl.isUnresolved || isUnresolvedAliasDeclaration(resolvedDecl)) {
+                return;
+            }
         }
 
         // If the resolved decl is still an alias, it means it
@@ -65,13 +74,13 @@ export function addDeclarationsToDefinitions(
             resolvedDecl.type === DeclarationType.Alias &&
             resolvedDecl.symbolName &&
             resolvedDecl.submoduleFallback &&
-            resolvedDecl.submoduleFallback.path
+            !resolvedDecl.submoduleFallback.uri.isEmpty()
         ) {
             resolvedDecl = resolvedDecl.submoduleFallback;
         }
 
         _addIfUnique(definitions, {
-            path: resolvedDecl.path,
+            uri: resolvedDecl.uri,
             range: resolvedDecl.range,
         });
 
@@ -81,22 +90,22 @@ export function addDeclarationsToDefinitions(
             if (functionType && isOverloadedFunction(functionType)) {
                 for (const overloadDecl of functionType.overloads.map((o) => o.details.declaration).filter(isDefined)) {
                     _addIfUnique(definitions, {
-                        path: overloadDecl.path,
+                        uri: overloadDecl.uri,
                         range: overloadDecl.range,
                     });
                 }
             }
         }
 
-        if (!isStubFile(resolvedDecl.path)) {
+        if (!isStubFile(resolvedDecl.uri)) {
             return;
         }
 
         if (resolvedDecl.type === DeclarationType.Alias) {
             // Add matching source module
             sourceMapper
-                .findModules(resolvedDecl.path)
-                .map((m) => getFileInfo(m)?.filePath)
+                .findModules(resolvedDecl.uri)
+                .map((m) => getFileInfo(m)?.fileUri)
                 .filter(isDefined)
                 .forEach((f) => _addIfUnique(definitions, _createModuleEntry(f)));
             return;
@@ -104,9 +113,9 @@ export function addDeclarationsToDefinitions(
 
         const implDecls = sourceMapper.findDeclarations(resolvedDecl);
         for (const implDecl of implDecls) {
-            if (implDecl && implDecl.path) {
+            if (implDecl && !implDecl.uri.isEmpty()) {
                 _addIfUnique(definitions, {
-                    path: implDecl.path,
+                    uri: implDecl.uri,
                     range: implDecl.range,
                 });
             }
@@ -122,7 +131,7 @@ export function filterDefinitions(filter: DefinitionFilter, definitions: Documen
     // If go-to-declaration is supported, attempt to only show only pyi files in go-to-declaration
     // and none in go-to-definition, unless filtering would produce an empty list.
     const preferStubs = filter === DefinitionFilter.PreferStubs;
-    const wantedFile = (v: DocumentRange) => preferStubs === isStubFile(v.path);
+    const wantedFile = (v: DocumentRange) => preferStubs === isStubFile(v.uri);
     if (definitions.find(wantedFile)) {
         return definitions.filter(wantedFile);
     }
@@ -134,6 +143,7 @@ class DefinitionProviderBase {
     protected constructor(
         protected readonly sourceMapper: SourceMapper,
         protected readonly evaluator: TypeEvaluator,
+        private readonly _serviceProvider: ServiceProvider | undefined,
         protected readonly node: ParseNode | undefined,
         protected readonly offset: number,
         private readonly _filter: DefinitionFilter,
@@ -145,19 +155,13 @@ class DefinitionProviderBase {
 
         const definitions: DocumentRange[] = [];
 
-        // Let extensions have a try first.
-        Extensions.getProgramExtensions(node).forEach((e) => {
-            if (e.declarationProviderExtension) {
-                const declarations = e.declarationProviderExtension.tryGetDeclarations(
-                    this.evaluator,
-                    node,
-                    offset,
-                    DeclarationUseCase.Definition,
-                    this.token
-                );
+        const factories = this._serviceProvider?.tryGet(ServiceKeys.symbolDefinitionProvider);
+        if (factories) {
+            factories.forEach((f) => {
+                const declarations = f.tryGetDeclarations(node, offset, this.token);
                 this.resolveDeclarations(declarations, definitions);
-            }
-        });
+            });
+        }
 
         // There should be only one 'definition', so only if extensions failed should we try again.
         if (definitions.length === 0) {
@@ -185,16 +189,16 @@ class DefinitionProviderBase {
 export class DefinitionProvider extends DefinitionProviderBase {
     constructor(
         program: ProgramView,
-        filePath: string,
+        fileUri: Uri,
         position: Position,
         filter: DefinitionFilter,
         token: CancellationToken
     ) {
-        const sourceMapper = program.getSourceMapper(filePath, token);
-        const parseResults = program.getParseResults(filePath);
+        const sourceMapper = program.getSourceMapper(fileUri, token);
+        const parseResults = program.getParseResults(fileUri);
         const { node, offset } = _tryGetNode(parseResults, position);
 
-        super(sourceMapper, program.evaluator!, node, offset, filter, token);
+        super(sourceMapper, program.evaluator!, program.serviceProvider, node, offset, filter, token);
     }
 
     static getDefinitionsForNode(
@@ -204,7 +208,15 @@ export class DefinitionProvider extends DefinitionProviderBase {
         offset: number,
         token: CancellationToken
     ) {
-        const provider = new DefinitionProviderBase(sourceMapper, evaluator, node, offset, DefinitionFilter.All, token);
+        const provider = new DefinitionProviderBase(
+            sourceMapper,
+            evaluator,
+            undefined,
+            node,
+            offset,
+            DefinitionFilter.All,
+            token
+        );
         return provider.getDefinitionsForNode(node, offset);
     }
 
@@ -218,15 +230,15 @@ export class DefinitionProvider extends DefinitionProviderBase {
 }
 
 export class TypeDefinitionProvider extends DefinitionProviderBase {
-    private readonly _filePath: string;
+    private readonly _fileUri: Uri;
 
-    constructor(program: ProgramView, filePath: string, position: Position, token: CancellationToken) {
-        const sourceMapper = program.getSourceMapper(filePath, token, /*mapCompiled*/ false, /*preferStubs*/ true);
-        const parseResults = program.getParseResults(filePath);
+    constructor(program: ProgramView, fileUri: Uri, position: Position, token: CancellationToken) {
+        const sourceMapper = program.getSourceMapper(fileUri, token, /*mapCompiled*/ false, /*preferStubs*/ true);
+        const parseResults = program.getParseResults(fileUri);
         const { node, offset } = _tryGetNode(parseResults, position);
 
-        super(sourceMapper, program.evaluator!, node, offset, DefinitionFilter.All, token);
-        this._filePath = filePath;
+        super(sourceMapper, program.evaluator!, program.serviceProvider, node, offset, DefinitionFilter.All, token);
+        this._fileUri = fileUri;
     }
 
     getDefinitions(): DocumentRange[] | undefined {
@@ -247,7 +259,7 @@ export class TypeDefinitionProvider extends DefinitionProviderBase {
                     if (subtype?.category === TypeCategory.Class) {
                         appendArray(
                             declarations,
-                            this.sourceMapper.findClassDeclarationsByType(this._filePath, subtype)
+                            this.sourceMapper.findClassDeclarationsByType(this._fileUri, subtype)
                         );
                     }
                 });
@@ -273,7 +285,7 @@ export class TypeDefinitionProvider extends DefinitionProviderBase {
     }
 }
 
-function _tryGetNode(parseResults: ParseResults | undefined, position: Position) {
+function _tryGetNode(parseResults: ParseFileResults | undefined, position: Position) {
     if (!parseResults) {
         return { node: undefined, offset: 0 };
     }
@@ -283,12 +295,12 @@ function _tryGetNode(parseResults: ParseResults | undefined, position: Position)
         return { node: undefined, offset: 0 };
     }
 
-    return { node: ParseTreeUtils.findNodeByOffset(parseResults.parseTree, offset), offset };
+    return { node: ParseTreeUtils.findNodeByOffset(parseResults.parserOutput.parseTree, offset), offset };
 }
 
-function _createModuleEntry(filePath: string): DocumentRange {
+function _createModuleEntry(uri: Uri): DocumentRange {
     return {
-        path: filePath,
+        uri,
         range: {
             start: { line: 0, character: 0 },
             end: { line: 0, character: 0 },
@@ -298,7 +310,7 @@ function _createModuleEntry(filePath: string): DocumentRange {
 
 function _addIfUnique(definitions: DocumentRange[], itemToAdd: DocumentRange) {
     for (const def of definitions) {
-        if (def.path === itemToAdd.path && rangesAreEqual(def.range, itemToAdd.range)) {
+        if (def.uri.equals(itemToAdd.uri) && rangesAreEqual(def.range, itemToAdd.range)) {
             return;
         }
     }

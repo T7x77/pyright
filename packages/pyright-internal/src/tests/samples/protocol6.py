@@ -21,7 +21,7 @@ class Ungulate(Mammal[_T3], Protocol):
 
 
 class CamelLike(Ungulate[bytes], Protocol):
-    species: Literal["camel"]
+    species: Literal["camel"]  # pyright: ignore[reportIncompatibleVariableOverride]
 
 
 class Sloth:
@@ -52,7 +52,7 @@ class Cow:
 
 a: Mammal[str] = Sloth()
 
-# This should generage an error because Armadillo
+# This should generate an error because Armadillo
 # uses bytes for its attributes, not str.
 b: Mammal[str] = Armadillo()
 

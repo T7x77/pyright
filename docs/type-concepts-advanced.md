@@ -66,18 +66,18 @@ In addition to assignment-based type narrowing, Pyright supports the following t
 * `x == L` and `x != L` (where L is an expression that evaluates to a literal type)
 * `x.y is None` and `x.y is not None` (where x is a type that is distinguished by a field with a None)
 * `x.y is E` and `x.y is not E` (where E is a literal enum or bool and x is a type that is distinguished by a field with a literal type)
-* `x.y == L` and `x.y != L` (where L is a literal expression and x is a type that is distinguished by a field or property with a literal type)
+* `x.y == LN` and `x.y != LN` (where LN is a literal expression or `None` and x is a type that is distinguished by a field or property with a literal type)
 * `x[K] == V`, `x[K] != V`, `x[K] is V`, and `x[K] is not V` (where K and V are literal expressions and x is a type that is distinguished by a TypedDict field with a literal type)
 * `x[I] == V` and `x[I] != V` (where I and V are literal expressions and x is a known-length tuple that is distinguished by the index indicated by I)
 * `x[I] is B` and `x[I] is not B` (where I is a literal expression, B is a `bool` or enum literal, and x is a known-length tuple that is distinguished by the index indicated by I)
 * `x[I] is None` and `x[I] is not None` (where I is a literal expression and x is a known-length tuple that is distinguished by the index indicated by I)
-* `len(x) == L` and `len(x) != L` (where x is tuple and L is a literal integer)
+* `len(x) == L`, `len(x) != L`, `len(x) < L`, etc. (where x is tuple and L is an expression that evaluates to an int literal type)
 * `x in y` or `x not in y` (where y is instance of list, set, frozenset, deque, tuple, dict, defaultdict, or OrderedDict)
 * `S in D` and `S not in D` (where S is a string literal and D is a TypedDict)
 * `isinstance(x, T)` (where T is a type or a tuple of types)
 * `issubclass(x, T)` (where T is a type or a tuple of types)
 * `callable(x)`
-* `f(x)` (where f is a user-defined type guard as defined in [PEP 647](https://www.python.org/dev/peps/pep-0647/))
+* `f(x)` (where f is a user-defined type guard as defined in [PEP 647](https://www.python.org/dev/peps/pep-0647/) or [PEP 742](https://www.python.org/dev/peps/pep-0742))
 * `bool(x)` (where x is any expression that is statically verifiable to be truthy or falsey in all cases)
 * `x` (where x is any expression that is statically verifiable to be truthy or falsey in all cases)
 
@@ -197,7 +197,7 @@ def func4(value: str | int) -> str:
 
 If you later added another color to the `Color` enumeration above (e.g. `YELLOW = 4`), Pyright would detect that `func3` no longer exhausts all members of the enumeration and possibly returns `None`, which violates the declared return type. Likewise, if you modify the type of the `value` parameter in `func4` to expand the union, a similar error will be produced.
 
-This “narrowing for implied else” technique works for all narrowing expressions listed above with the exception of simple falsey/truthy statements and type guards. It is also limited to simple names and doesn’t work with member access or index expressions. These are excluded because they are not generally used for exhaustive checks, and their inclusion would have a significant impact on analysis performance.
+This “narrowing for implied else” technique works for all narrowing expressions listed above with the exception of simple falsey/truthy statements and type guards. It is also limited to simple names and doesn’t work with member access or index expressions, and it requires that the name has a declared type (an explicit type annotation). These limitations are imposed because this functionality would otherwise have significant impact on analysis performance.
 
 
 ### Narrowing Any
@@ -241,19 +241,19 @@ def func(val: int | None):
         inner_2()
 ```
 
-### Constrained Type Variables
+### Value-Constrained Type Variables
 
-When a TypeVar is defined, it can be constrained to two or more types.
+When a TypeVar is defined, it can be constrained to two or more types (values).
 
 ```python
 # Example of unconstrained type variable
 _T = TypeVar("_T")
 
-# Example of constrained type variables
+# Example of value-constrained type variables
 _StrOrFloat = TypeVar("_StrOrFloat", str, float)
 ```
 
-When a constrained TypeVar appears more than once within a function signature, the type provided for all instances of the TypeVar must be consistent.
+When a value-constrained TypeVar appears more than once within a function signature, the type provided for all instances of the TypeVar must be consistent.
 
 ```python
 def add(a: _StrOrFloat, b: _StrOrFloat) -> _StrOrFloat:
@@ -319,7 +319,7 @@ Some functions or methods can return one of several different types. In cases wh
 
 [PEP 484](https://www.python.org/dev/peps/pep-0484/#function-method-overloading) introduced the `@overload` decorator and described how it can be used, but the PEP did not specify precisely how a type checker should choose the “best” overload. Pyright uses the following rules.
 
-1. Pyright first filters the list of overloads based on simple “arity” (number of arguments) and keyword argument matching. For example, if one overload requires two position arguments but only one positional argument is supplied by the caller, that overload is eliminated from consideration. Likewise, if the call includes a keyword argument but no corresponding parameter is included in the overload, it is eliminated from consideration.
+1. Pyright first filters the list of overloads based on simple “arity” (number of arguments) and keyword argument matching. For example, if one overload requires two positional arguments but only one positional argument is supplied by the caller, that overload is eliminated from consideration. Likewise, if the call includes a keyword argument but no corresponding parameter is included in the overload, it is eliminated from consideration.
 
 2. Pyright next considers the types of the arguments and compares them to the declared types of the corresponding parameters. If the types do not match for a given overload, that overload is eliminated from consideration. Bidirectional type inference is used to determine the types of the argument expressions.
 
@@ -329,7 +329,7 @@ Some functions or methods can return one of several different types. In cases wh
     Exception 1: When an `*args` (unpacked) argument matches a `*args` parameter in one of the overload signatures, this overrides the normal order-based rule.
     Exception 2: When two or more overloads match because an argument evaluates to `Any` or `Unknown`, the matching overload is ambiguous. In this case, pyright examines the return types of the remaining overloads and eliminates types that are duplicates or are subsumed by (i.e. proper subtypes of) other types in the list. If only one type remains after this coalescing step, that type is used. If more than one type remains after this coalescing step, the type of the call expression evaluates to `Unknown`. For example, if two overloads are matched due to an argument that evaluates to `Any`, and those two overloads have return types of `str` and `LiteralString`, pyright will coalesce this to just `str` because `LiteralString` is a proper subtype of `str`. If the two overloads have return types of `str` and `bytes`, the call expression will evaluate to `Unknown` because `str` and `bytes` have no overlap.
 
-5. If no overloads remain, Pyright considers whether any of the arguments are union types. If so, these union types are expanded into their constituent subtypes, and the entire process of overload matching is repeated with the expanded argument types. If two or more overloads match, the union of their respective return types form the final return type for the call expression.
+5. If no overloads remain, Pyright considers whether any of the arguments are union types. If so, these union types are expanded into their constituent subtypes, and the entire process of overload matching is repeated with the expanded argument types. If two or more overloads match, the union of their respective return types form the final return type for the call expression. This "union expansion" can result in a combinatoric explosion if many arguments evaluate to union types. For example, if four arguments are present, and they all evaluate to unions that expand to ten subtypes, this could result in 10^4 combinations. Pyright expands unions for arguments left to right and halts expansion when the number of signatures exceeds 64.
 
 6. If no overloads remain and all unions have been expanded, a diagnostic is generated indicating that the supplied arguments are incompatible with all overload signatures.
 
@@ -455,7 +455,7 @@ class Child(Parent):
     y = None  # Error: Incompatible type
 ```
 
-The derived class can redeclare the type of a class or instance variable. If `reportIncompatibleVariableOverride` is enabled, the redeclared type must be the same as the type declared by the parent class or a subtype thereof.
+The derived class can redeclare the type of a class or instance variable. If `reportIncompatibleVariableOverride` is enabled, the redeclared type must be the same as the type declared by the parent class. If the variable is immutable (as in a frozen `dataclass`), it is considered covariant, and it can be redeclared as a subtype of the type declared by the parent class.
 
 ```python
 class Parent:
@@ -463,7 +463,7 @@ class Parent:
     y: int
 
 class Child(Parent):
-    x: int  # This is OK because 'int' is a subtype of 'int | str | None'
+    x: int  # Type error: 'x' cannot be redeclared with subtype because variable is mutable and therefore invariant
     y: str  # Type error: 'y' cannot be redeclared with an incompatible type
 ```
 

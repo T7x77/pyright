@@ -22,13 +22,14 @@ import {
     TextEditorEdit,
     Uri,
     window,
+    workspace,
+    WorkspaceConfiguration,
 } from 'vscode';
 import {
     CancellationToken,
     ConfigurationParams,
     ConfigurationRequest,
     DidChangeConfigurationNotification,
-    HandlerResult,
     LanguageClient,
     LanguageClientOptions,
     ResponseError,
@@ -95,9 +96,8 @@ export async function activate(context: ExtensionContext) {
     const clientOptions: LanguageClientOptions = {
         // Register the server for python source files.
         documentSelector: [
-            {
-                language: 'python',
-            },
+            { scheme: 'file', language: 'python' },
+            { scheme: 'untitled', language: 'python' },
         ],
         synchronize: {
             // Synchronize the setting section to the server.
@@ -109,26 +109,38 @@ export async function activate(context: ExtensionContext) {
             // us to inject the proper "python.pythonPath" setting from the Python extension's
             // private settings store.
             workspace: {
-                configuration: (
+                configuration: async (
                     params: ConfigurationParams,
                     token: CancellationToken,
                     next: ConfigurationRequest.HandlerSignature
-                ): HandlerResult<any[], void> => {
-                    // Hand-collapse "Thenable<A> | Thenable<B> | Thenable<A|B>" into just "Thenable<A|B>" to make TS happy.
-                    const result: any[] | ResponseError<void> | Thenable<any[] | ResponseError<void>> = next(
-                        params,
-                        token
-                    );
+                ) => {
+                    let result = next(params, token);
+                    if (isThenable(result)) {
+                        result = await result;
+                    }
+                    if (result instanceof ResponseError) {
+                        return result;
+                    }
+
+                    for (const [i, item] of params.items.entries()) {
+                        if (item.section === 'python.analysis') {
+                            const analysisConfig = workspace.getConfiguration(
+                                item.section,
+                                item.scopeUri ? Uri.parse(item.scopeUri) : undefined
+                            );
+
+                            // If stubPath is not set, remove it rather than sending default value.
+                            // This lets the server know that it's unset rather than explicitly
+                            // set to the default value (typings) so it can behave differently.
+                            if (!isConfigSettingSetByUser(analysisConfig, 'stubPath')) {
+                                delete (result[i] as any).stubPath;
+                            }
+                        }
+                    }
 
                     // For backwards compatibility, set python.pythonPath to the configured
                     // value as though it were in the user's settings.json file.
-                    const addPythonPath = (
-                        settings: any[] | ResponseError<void>
-                    ): Promise<any[] | ResponseError<any>> => {
-                        if (settings instanceof ResponseError) {
-                            return Promise.resolve(settings);
-                        }
-
+                    const addPythonPath = (settings: any[]): Promise<any[]> => {
                         const pythonPathPromises: Promise<string | undefined>[] = params.items.map((item) => {
                             if (item.section === 'python') {
                                 const uri = item.scopeUri ? Uri.parse(item.scopeUri) : undefined;
@@ -156,10 +168,6 @@ export async function activate(context: ExtensionContext) {
                         });
                     };
 
-                    if (isThenable(result)) {
-                        return result.then(addPythonPath);
-                    }
-
                     return addPythonPath(result);
                 },
             },
@@ -171,7 +179,7 @@ export async function activate(context: ExtensionContext) {
     languageClient = client;
 
     // Register our custom commands.
-    const textEditorCommands = [Commands.orderImports, Commands.addMissingOptionalToParam];
+    const textEditorCommands = [Commands.orderImports];
     textEditorCommands.forEach((commandName) => {
         context.subscriptions.push(
             commands.registerTextEditorCommand(
@@ -219,11 +227,11 @@ export async function activate(context: ExtensionContext) {
         // Register the commands that only work when in development mode.
         context.subscriptions.push(
             commands.registerCommand(Commands.dumpTokens, () => {
-                const fileName = window.activeTextEditor?.document.fileName;
-                if (fileName) {
+                const uri = window.activeTextEditor?.document.uri.toString();
+                if (uri) {
                     client.sendRequest('workspace/executeCommand', {
                         command: Commands.dumpFileDebugInfo,
-                        arguments: [fileName, 'tokens'],
+                        arguments: [uri, 'tokens'],
                     });
                 }
             })
@@ -231,11 +239,11 @@ export async function activate(context: ExtensionContext) {
 
         context.subscriptions.push(
             commands.registerCommand(Commands.dumpNodes, () => {
-                const fileName = window.activeTextEditor?.document.fileName;
-                if (fileName) {
+                const uri = window.activeTextEditor?.document.uri.toString();
+                if (uri) {
                     client.sendRequest('workspace/executeCommand', {
                         command: Commands.dumpFileDebugInfo,
-                        arguments: [fileName, 'nodes'],
+                        arguments: [uri, 'nodes'],
                     });
                 }
             })
@@ -243,43 +251,43 @@ export async function activate(context: ExtensionContext) {
 
         context.subscriptions.push(
             commands.registerCommand(Commands.dumpTypes, () => {
-                const fileName = window.activeTextEditor?.document.fileName;
-                if (fileName) {
+                const uri = window.activeTextEditor?.document.uri.toString();
+                if (uri) {
                     const start = window.activeTextEditor!.selection.start;
                     const end = window.activeTextEditor!.selection.end;
                     const startOffset = window.activeTextEditor!.document.offsetAt(start);
                     const endOffset = window.activeTextEditor!.document.offsetAt(end);
                     client.sendRequest('workspace/executeCommand', {
                         command: Commands.dumpFileDebugInfo,
-                        arguments: [fileName, 'types', startOffset, endOffset],
+                        arguments: [uri, 'types', startOffset, endOffset],
                     });
                 }
             })
         );
         context.subscriptions.push(
             commands.registerCommand(Commands.dumpCachedTypes, () => {
-                const fileName = window.activeTextEditor?.document.fileName;
-                if (fileName) {
+                const uri = window.activeTextEditor?.document.uri.toString();
+                if (uri) {
                     const start = window.activeTextEditor!.selection.start;
                     const end = window.activeTextEditor!.selection.end;
                     const startOffset = window.activeTextEditor!.document.offsetAt(start);
                     const endOffset = window.activeTextEditor!.document.offsetAt(end);
                     client.sendRequest('workspace/executeCommand', {
                         command: Commands.dumpFileDebugInfo,
-                        arguments: [fileName, 'cachedtypes', startOffset, endOffset],
+                        arguments: [uri, 'cachedtypes', startOffset, endOffset],
                     });
                 }
             })
         );
         context.subscriptions.push(
             commands.registerCommand(Commands.dumpCodeFlowGraph, () => {
-                const fileName = window.activeTextEditor?.document.fileName;
-                if (fileName) {
+                const uri = window.activeTextEditor?.document.uri.toString();
+                if (uri) {
                     const start = window.activeTextEditor!.selection.start;
                     const startOffset = window.activeTextEditor!.document.offsetAt(start);
                     client.sendRequest('workspace/executeCommand', {
                         command: Commands.dumpFileDebugInfo,
-                        arguments: [fileName, 'codeflowgraph', startOffset],
+                        arguments: [uri, 'codeflowgraph', startOffset],
                     });
                 }
             })
@@ -372,4 +380,20 @@ function installPythonPathChangedListener(
     });
 
     pythonPathChangedListenerMap.set(uriString, uriString);
+}
+
+function isConfigSettingSetByUser(configuration: WorkspaceConfiguration, setting: string): boolean {
+    const inspect = configuration.inspect(setting);
+    if (inspect === undefined) {
+        return false;
+    }
+
+    return (
+        inspect.globalValue !== undefined ||
+        inspect.workspaceValue !== undefined ||
+        inspect.workspaceFolderValue !== undefined ||
+        inspect.globalLanguageValue !== undefined ||
+        inspect.workspaceLanguageValue !== undefined ||
+        inspect.workspaceFolderLanguageValue !== undefined
+    );
 }

@@ -225,6 +225,13 @@ def func(a, b=0, c=None):
 reveal_type(func)  # (a: Unknown, b: int, c: Unknown | None) -> None
 ```
 
+This inference technique also applies to lambdas whose input parameters include default arguments.
+
+```python
+cb = lambda x = "": x
+reveal_type(cb)  # (x: str = "" -> str)
+```
+
 #### Literals
 
 Python 3.8 introduced support for _literal types_. This allows a type checker like Pyright to track specific literal values of str, bytes, int, bool, and enum values. As with other types, literal types can be declared.
@@ -254,17 +261,24 @@ var1 = [4]
 When inferring the type of a tuple expression (in the absence of bidirectional inference hints), Pyright assumes that the tuple has a fixed length, and each tuple element is typed as specifically as possible.
 
 ```python
-# The inferred type is tuple[Literal[1], Literal["a"], Literal[True]]
+# The inferred type is tuple[Literal[1], Literal["a"], Literal[True]].
 var1 = (1, "a", True)
 
 def func1(a: int):
-    # The inferred type is tuple[int, int]
+    # The inferred type is tuple[int, int].
     var2 = (a, a)
 
     # If you want the type to be tuple[int, ...]
     # (i.e. a homogeneous tuple of indeterminate length),
     # use a type annotation.
     var3: tuple[int, ...] = (a, a)
+```
+
+Because tuples are typed as specifically as possible, literal types are normally retained. However, as an exception to this inference rule, if the tuple expression is nested within another tuple, set, list or dictionary expression, literal types are not retained. This is done to avoid the inference of complex types (e.g. unions with many subtypes) when evaluating tuple statements with many entries.
+
+```python
+# The inferred type is list[tuple[int, str, bool]].
+var4 = [(1, "a", True), (2, "b", False), (3, "c", False)]
 ```
 
 #### List Expressions

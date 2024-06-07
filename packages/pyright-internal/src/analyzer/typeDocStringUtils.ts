@@ -12,11 +12,12 @@ import {
     ClassDeclaration,
     Declaration,
     DeclarationBase,
-    DeclarationType,
     FunctionDeclaration,
     isClassDeclaration,
     isFunctionDeclaration,
+    isSpecialBuiltInClassDeclaration,
     isVariableDeclaration,
+    SpecialBuiltInClassDeclaration,
     VariableDeclaration,
 } from '../analyzer/declaration';
 import * as ParseTreeUtils from '../analyzer/parseTreeUtils';
@@ -33,21 +34,22 @@ import {
     TypeCategory,
 } from '../analyzer/types';
 import { addIfNotNull, appendArray } from '../common/collectionUtils';
+import { Uri } from '../common/uri/uri';
 import { ModuleNode, ParseNodeType } from '../parser/parseNodes';
 import { TypeEvaluator } from './typeEvaluatorTypes';
 import {
     ClassIteratorFlags,
-    ClassMemberLookupFlags,
     getClassIterator,
     getClassMemberIterator,
     isMaybeDescriptorInstance,
+    MemberAccessFlags,
 } from './typeUtils';
 
 const DefaultClassIteratorFlagsForFunctions =
-    ClassMemberLookupFlags.SkipObjectBaseClass |
-    ClassMemberLookupFlags.SkipInstanceVariables |
-    ClassMemberLookupFlags.SkipOriginalClass |
-    ClassMemberLookupFlags.DeclaredTypesOnly;
+    MemberAccessFlags.SkipObjectBaseClass |
+    MemberAccessFlags.SkipInstanceMembers |
+    MemberAccessFlags.SkipOriginalClass |
+    MemberAccessFlags.DeclaredTypesOnly;
 
 function isInheritedFromBuiltin(type: FunctionType | OverloadedFunctionType, classType?: ClassType): boolean {
     if (type.category === TypeCategory.OverloadedFunction) {
@@ -60,10 +62,10 @@ function isInheritedFromBuiltin(type: FunctionType | OverloadedFunctionType, cla
     // Functions that are bound to a different type than where they
     // were declared are inherited.
     return (
-        type.details.moduleName === 'builtins' &&
-        !!classType &&
+        !!type.details.methodClass &&
+        ClassType.isBuiltIn(type.details.methodClass) &&
         !!type.boundToType &&
-        !ClassType.isSameGenericClass(classType, type.boundToType)
+        !ClassType.isBuiltIn(type.boundToType)
     );
 }
 
@@ -160,7 +162,7 @@ export function getPropertyDocStringInherited(
 
 export function getVariableInStubFileDocStrings(decl: VariableDeclaration, sourceMapper: SourceMapper) {
     const docStrings: string[] = [];
-    if (!isStubFile(decl.path)) {
+    if (!isStubFile(decl.uri)) {
         return docStrings;
     }
 
@@ -193,14 +195,14 @@ export function getModuleDocStringFromModuleNodes(modules: ModuleNode[]): string
     return undefined;
 }
 
-export function getModuleDocStringFromPaths(filePaths: string[], sourceMapper: SourceMapper) {
+export function getModuleDocStringFromUris(uris: Uri[], sourceMapper: SourceMapper) {
     const modules: ModuleNode[] = [];
-    for (const filePath of filePaths) {
-        if (isStubFile(filePath)) {
-            addIfNotNull(modules, sourceMapper.getModuleNode(filePath));
+    for (const uri of uris) {
+        if (isStubFile(uri)) {
+            addIfNotNull(modules, sourceMapper.getModuleNode(uri));
         }
 
-        appendArray(modules, sourceMapper.findModules(filePath));
+        appendArray(modules, sourceMapper.findModules(uri));
     }
 
     return getModuleDocStringFromModuleNodes(modules);
@@ -213,8 +215,8 @@ export function getModuleDocString(
 ) {
     let docString = type.docString;
     if (!docString) {
-        const filePath = resolvedDecl?.path ?? type.filePath;
-        docString = getModuleDocStringFromPaths([filePath], sourceMapper);
+        const uri = resolvedDecl?.uri ?? type.fileUri;
+        docString = getModuleDocStringFromUris([uri], sourceMapper);
     }
 
     return docString;
@@ -226,14 +228,9 @@ export function getClassDocString(
     sourceMapper: SourceMapper
 ) {
     let docString = classType.details.docString;
-    if (!docString && resolvedDecl && isClassDeclaration(resolvedDecl)) {
-        docString = _getFunctionOrClassDeclsDocString([resolvedDecl]);
-        if (
-            !docString &&
-            resolvedDecl &&
-            isStubFile(resolvedDecl.path) &&
-            resolvedDecl.type === DeclarationType.Class
-        ) {
+    if (!docString && resolvedDecl && _isAnyClassDeclaration(resolvedDecl)) {
+        docString = isClassDeclaration(resolvedDecl) ? _getFunctionOrClassDeclsDocString([resolvedDecl]) : undefined;
+        if (!docString && resolvedDecl && isStubFile(resolvedDecl.uri)) {
             for (const implDecl of sourceMapper.findDeclarations(resolvedDecl)) {
                 if (isVariableDeclaration(implDecl) && !!implDecl.docString) {
                     docString = implDecl.docString;
@@ -249,7 +246,7 @@ export function getClassDocString(
     }
 
     if (!docString && resolvedDecl) {
-        const implDecls = sourceMapper.findClassDeclarationsByType(resolvedDecl.path, classType);
+        const implDecls = sourceMapper.findClassDeclarationsByType(resolvedDecl.uri, classType);
         if (implDecls) {
             const classDecls = implDecls.filter((d) => isClassDeclaration(d)).map((d) => d);
             docString = _getFunctionOrClassDeclsDocString(classDecls);
@@ -294,7 +291,7 @@ function _getOverloadedFunctionDocStrings(
                 docStrings.push(overload.details.docString);
             }
         });
-    } else if (resolvedDecl && isStubFile(resolvedDecl.path) && isFunctionDeclaration(resolvedDecl)) {
+    } else if (resolvedDecl && isStubFile(resolvedDecl.uri) && isFunctionDeclaration(resolvedDecl)) {
         const implDecls = sourceMapper.findFunctionDeclarations(resolvedDecl);
         const docString = _getFunctionOrClassDeclsDocString(implDecls);
         if (docString) {
@@ -332,7 +329,7 @@ function _getPropertyDocStringInherited(
             continue;
         }
 
-        const symbol = mroClass.details.fields.get(fieldName);
+        const symbol = ClassType.getSymbolTable(mroClass).get(fieldName);
         // Get both the setter and getter declarations
         const decls = symbol?.getDeclarations();
         if (decls) {
@@ -372,7 +369,7 @@ function _getFunctionDocString(type: Type, resolvedDecl: FunctionDeclaration | u
 
 function _getFunctionDocStringFromDeclaration(resolvedDecl: FunctionDeclaration, sourceMapper: SourceMapper) {
     let docString = _getFunctionOrClassDeclsDocString([resolvedDecl]);
-    if (!docString && isStubFile(resolvedDecl.path)) {
+    if (!docString && isStubFile(resolvedDecl.uri)) {
         const implDecls = sourceMapper.findFunctionDeclarations(resolvedDecl);
         docString = _getFunctionOrClassDeclsDocString(implDecls);
     }
@@ -389,4 +386,8 @@ function _getFunctionOrClassDeclsDocString(decls: FunctionDeclaration[] | ClassD
     }
 
     return undefined;
+}
+
+function _isAnyClassDeclaration(decl: Declaration): decl is ClassDeclaration | SpecialBuiltInClassDeclaration {
+    return isClassDeclaration(decl) || isSpecialBuiltInClassDeclaration(decl);
 }

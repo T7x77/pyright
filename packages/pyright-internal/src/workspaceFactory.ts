@@ -9,7 +9,8 @@ import { InitializeParams, WorkspaceFoldersChangeEvent } from 'vscode-languagese
 import { AnalyzerService } from './analyzer/service';
 import { ConsoleInterface } from './common/console';
 import { createDeferred } from './common/deferred';
-import { UriParser } from './common/uriParser';
+import { Uri } from './common/uri/uri';
+import { ServiceProvider } from './common/extensibility';
 
 let WorkspaceFactoryIdCounter = 0;
 
@@ -69,42 +70,45 @@ export function createInitStatus(): InitStatus {
     return self;
 }
 
+export interface WorkspaceFolder {
+    workspaceName: string;
+    rootUri: Uri | undefined;
+}
+
 // path and uri will point to a workspace itself. It could be a folder
 // if the workspace represents a folder. it could be '' if it is the default workspace.
 // But it also could be a file if it is a virtual workspace.
 // rootPath will always point to the folder that contains the workspace.
-export interface Workspace {
-    workspaceName: string;
-    rootPath: string;
-    uri: string;
+export interface Workspace extends WorkspaceFolder {
     kinds: string[];
     service: AnalyzerService;
     disableLanguageServices: boolean;
+    disableTaggedHints: boolean;
     disableOrganizeImports: boolean;
     disableWorkspaceSymbol: boolean;
     isInitialized: InitStatus;
-    searchPathsToWatch: string[];
-    pythonPath: string | undefined;
+    searchPathsToWatch: Uri[];
+    pythonPath: Uri | undefined;
     pythonPathKind: WorkspacePythonPathKind;
+    pythonEnvironmentName: string | undefined;
+}
+
+export interface NormalWorkspace extends Workspace {
+    rootUri: Uri;
 }
 
 export class WorkspaceFactory {
     private _defaultWorkspacePath = '<default>';
-    private _map = new Map<string, Workspace>();
+    private _map = new Map<string, AllWorkspace>();
     private _id = WorkspaceFactoryIdCounter++;
-
     constructor(
         private readonly _console: ConsoleInterface,
-        private readonly _uriParser: UriParser,
         private readonly _isWeb: boolean,
-        private readonly _createService: (
-            name: string,
-            rootPath: string,
-            uri: string,
-            kinds: string[]
-        ) => AnalyzerService,
-        private readonly _isPythonPathImmutable: (path: string) => boolean,
-        private readonly _onWorkspaceCreated: (workspace: Workspace) => void
+        private readonly _createService: (name: string, rootPath: Uri, kinds: string[]) => AnalyzerService,
+        private readonly _isPythonPathImmutable: (uri: Uri) => boolean,
+        private readonly _onWorkspaceCreated: (workspace: AllWorkspace) => void,
+        private readonly _onWorkspaceRemoved: (workspace: AllWorkspace) => void,
+        private readonly _serviceProvider: ServiceProvider
     ) {
         this._console.log(`WorkspaceFactory ${this._id} created`);
     }
@@ -113,48 +117,49 @@ export class WorkspaceFactory {
         // Create a service instance for each of the workspace folders.
         if (params.workspaceFolders) {
             params.workspaceFolders.forEach((folder) => {
-                const path = this._uriParser.decodeTextDocumentUri(folder.uri);
-                this._add(folder.uri, path, folder.name, undefined, WorkspacePythonPathKind.Mutable, [
-                    WellKnownWorkspaceKinds.Regular,
-                ]);
+                this._add(
+                    Uri.parse(folder.uri, this._serviceProvider),
+                    folder.name,
+                    undefined,
+                    WorkspacePythonPathKind.Mutable,
+                    [WellKnownWorkspaceKinds.Regular]
+                );
             });
         } else if (params.rootPath) {
-            this._add(params.rootUri || '', params.rootPath, '', undefined, WorkspacePythonPathKind.Mutable, [
-                WellKnownWorkspaceKinds.Regular,
-            ]);
+            this._add(
+                Uri.file(params.rootPath, this._serviceProvider),
+                '',
+                undefined,
+                WorkspacePythonPathKind.Mutable,
+                [WellKnownWorkspaceKinds.Regular]
+            );
         }
     }
 
     handleWorkspaceFoldersChanged(params: WorkspaceFoldersChangeEvent) {
         params.removed.forEach((workspaceInfo) => {
-            const rootPath = this._uriParser.decodeTextDocumentUri(workspaceInfo.uri);
+            const uri = Uri.parse(workspaceInfo.uri, this._serviceProvider);
             // Delete all workspaces for this folder. Even the ones generated for notebook kernels.
-            const workspaces = this.getNonDefaultWorkspaces().filter((w) => w.rootPath === rootPath);
+            const workspaces = this.getNonDefaultWorkspaces().filter((w) => w.rootUri.equals(uri));
             workspaces.forEach((w) => {
                 this._remove(w);
             });
         });
 
         params.added.forEach((workspaceInfo) => {
-            const rootPath = this._uriParser.decodeTextDocumentUri(workspaceInfo.uri);
-
+            const uri = Uri.parse(workspaceInfo.uri, this._serviceProvider);
             // If there's a workspace that contains this folder, we need to mimic files from this workspace to
             // to the new one. Otherwise the subfolder won't have the changes for the files in it.
-            const containing = this.items().filter((w) => rootPath.startsWith(w.rootPath))[0];
+            const containing = this.items().filter((w) => uri.startsWith(w.rootUri))[0];
 
             // Add the new workspace.
-            const newWorkspace = this._add(
-                workspaceInfo.uri,
-                rootPath,
-                workspaceInfo.name,
-                undefined,
-                WorkspacePythonPathKind.Mutable,
-                [WellKnownWorkspaceKinds.Regular]
-            );
+            const newWorkspace = this._add(uri, workspaceInfo.name, undefined, WorkspacePythonPathKind.Mutable, [
+                WellKnownWorkspaceKinds.Regular,
+            ]);
 
             // Move files from the containing workspace to the new one that are in the new folder.
             if (containing) {
-                this._mimicOpenFiles(containing, newWorkspace, (f) => f.startsWith(rootPath));
+                this._mimicOpenFiles(containing, newWorkspace, (f) => f.startsWith(uri));
             }
         });
     }
@@ -163,9 +168,9 @@ export class WorkspaceFactory {
         return Array.from(this._map.values());
     }
 
-    applyPythonPath(workspace: Workspace, newPythonPath: string | undefined): string | undefined {
+    applyPythonPath(workspace: Workspace, newPythonPath: Uri | undefined): Uri | undefined {
         // See if were allowed to apply the new python path
-        if (workspace.pythonPathKind === WorkspacePythonPathKind.Mutable && newPythonPath) {
+        if (workspace.pythonPathKind === WorkspacePythonPathKind.Mutable && !Uri.isEmpty(newPythonPath)) {
             const originalPythonPath = workspace.pythonPath;
             workspace.pythonPath = newPythonPath;
 
@@ -179,7 +184,7 @@ export class WorkspaceFactory {
             }
 
             // If the python path has changed, we may need to move the immutable files to the correct workspace.
-            if (originalPythonPath && originalPythonPath !== newPythonPath && workspaceInMap) {
+            if (originalPythonPath && !Uri.equals(newPythonPath, originalPythonPath) && workspaceInMap) {
                 // Potentially move immutable files from one workspace to another.
                 this._moveImmutableFilesToCorrectWorkspace(originalPythonPath, workspaceInMap);
             }
@@ -217,16 +222,14 @@ export class WorkspaceFactory {
         return false;
     }
 
-    getContainingWorkspace(filePath: string, pythonPath?: string) {
+    getContainingWorkspace(filePath: Uri, pythonPath?: Uri): NormalWorkspace | undefined {
         return this._getBestRegularWorkspace(
-            this.getNonDefaultWorkspaces(WellKnownWorkspaceKinds.Regular).filter((w) =>
-                filePath.startsWith(w.rootPath)
-            ),
+            this.getNonDefaultWorkspaces(WellKnownWorkspaceKinds.Regular).filter((w) => filePath.startsWith(w.rootUri)),
             pythonPath
         );
     }
 
-    moveFiles(filePaths: string[], fromWorkspace: Workspace, toWorkspace: Workspace) {
+    moveFiles(filePaths: Uri[], fromWorkspace: Workspace, toWorkspace: Workspace) {
         if (fromWorkspace === toWorkspace) {
             return;
         }
@@ -239,21 +242,13 @@ export class WorkspaceFactory {
                     const version = fileInfo.sourceFile.getClientVersion() ?? null;
                     const content = fileInfo.sourceFile.getFileContent() || '';
                     const ipythonMode = fileInfo.sourceFile.getIPythonMode();
-                    const chainedSourceFile = fileInfo.chainedSourceFile?.sourceFile.getFilePath();
-                    const realFilePath = fileInfo.sourceFile.getRealFilePath();
+                    const chainedSourceFile = fileInfo.chainedSourceFile?.sourceFile.getUri();
 
                     // Remove the file from the old workspace first (closing will propagate to the toWorkspace automatically).
                     fromWorkspace.service.setFileClosed(f, /* isTracked */ false);
 
                     // Then open it in the toWorkspace so that it is marked tracked there.
-                    toWorkspace.service.setFileOpened(
-                        f,
-                        version,
-                        content,
-                        ipythonMode,
-                        chainedSourceFile,
-                        realFilePath
-                    );
+                    toWorkspace.service.setFileOpened(f, version, content, ipythonMode, chainedSourceFile);
                 }
             });
 
@@ -264,10 +259,10 @@ export class WorkspaceFactory {
         }
     }
 
-    getNonDefaultWorkspaces(kind?: string): Workspace[] {
-        const workspaces: Workspace[] = [];
+    getNonDefaultWorkspaces(kind?: string): NormalWorkspace[] {
+        const workspaces: NormalWorkspace[] = [];
         this._map.forEach((workspace) => {
-            if (!workspace.rootPath) {
+            if (!workspace.rootUri) {
                 return;
             }
 
@@ -283,13 +278,13 @@ export class WorkspaceFactory {
 
     // Returns the best workspace for a file. Waits for the workspace to be finished handling other events before
     // returning the appropriate workspace.
-    async getWorkspaceForFile(filePath: string, pythonPath: string | undefined): Promise<Workspace> {
+    async getWorkspaceForFile(uri: Uri, pythonPath: Uri | undefined): Promise<Workspace> {
         // Wait for all workspaces to be initialized before attempting to find the best workspace. Otherwise
         // the list of files won't be complete and the `contains` check might fail.
         await Promise.all(this.items().map((w) => w.isInitialized.promise));
 
         // Find or create best match.
-        const workspace = await this._getOrCreateBestWorkspaceForFile(filePath, pythonPath);
+        const workspace = await this._getOrCreateBestWorkspaceForFile(uri, pythonPath);
 
         // The workspace may have just been created. Wait for it to be initialized before returning it.
         await workspace.isInitialized.promise;
@@ -297,12 +292,12 @@ export class WorkspaceFactory {
         return workspace;
     }
 
-    getWorkspaceForFileSync(filePath: string, pythonPath: string | undefined): Workspace {
+    getWorkspaceForFileSync(filePath: Uri, pythonPath: Uri | undefined): Workspace {
         // Find or create best match.
         return this._getOrCreateBestWorkspaceFileSync(filePath, pythonPath);
     }
 
-    async getContainingWorkspacesForFile(filePath: string): Promise<Workspace[]> {
+    async getContainingWorkspacesForFile(filePath: Uri): Promise<Workspace[]> {
         // Wait for all workspaces to be initialized before attempting to find the best workspace. Otherwise
         // the list of files won't be complete and the `contains` check might fail.
         await Promise.all(this.items().map((w) => w.isInitialized.promise));
@@ -316,17 +311,17 @@ export class WorkspaceFactory {
         return workspaces;
     }
 
-    getContainingWorkspacesForFileSync(filePath: string): Workspace[] {
+    getContainingWorkspacesForFileSync(fileUri: Uri): Workspace[] {
         // All workspaces that track the file should be considered.
-        let workspaces = this.items().filter((w) => w.service.isTracked(filePath));
+        let workspaces = this.items().filter((w) => w.service.isTracked(fileUri));
 
         // If that list is empty, get the best workspace
         if (workspaces.length === 0) {
-            workspaces.push(this._getOrCreateBestWorkspaceFileSync(filePath, undefined));
+            workspaces.push(this._getOrCreateBestWorkspaceFileSync(fileUri, undefined));
         }
 
         // If the file is immutable, then only return that workspace.
-        if (this._isPythonPathImmutable(filePath)) {
+        if (this._isPythonPathImmutable(fileUri)) {
             workspaces = workspaces.filter((w) => w.pythonPathKind === WorkspacePythonPathKind.Immutable);
         }
 
@@ -344,21 +339,18 @@ export class WorkspaceFactory {
         }
     }
 
-    private async _moveImmutableFilesToCorrectWorkspace(oldPythonPath: string, mutableWorkspace: Workspace) {
+    private async _moveImmutableFilesToCorrectWorkspace(oldPythonPath: Uri, mutableWorkspace: Workspace) {
         // If the python path changes we may need to move some immutable files around.
         // For example, if a notebook had the old python path, we need to create a new workspace
         // for the notebook.
         // If a notebook has the new python path but is currently in a workspace with the path hardcoded, we need to move it to
         // this workspace.
-        const oldPathFiles = Array.from(
-            new Set<string>(mutableWorkspace.service.getOpenFiles().filter((f) => this._isPythonPathImmutable(f)))
-        );
+        const oldPathFiles = mutableWorkspace.service.getOpenFiles().filter((f) => this._isPythonPathImmutable(f));
         const exitingWorkspaceWithSamePath = this.items().find(
-            (w) => w.pythonPath === mutableWorkspace.pythonPath && w !== mutableWorkspace
+            (w) => Uri.equals(w.pythonPath, mutableWorkspace.pythonPath) && w !== mutableWorkspace
         );
-        const newPathFiles = new Set<string>(
-            exitingWorkspaceWithSamePath?.service.getOpenFiles().filter((f) => this._isPythonPathImmutable(f))
-        );
+        const newPathFiles =
+            exitingWorkspaceWithSamePath?.service.getOpenFiles().filter((f) => this._isPythonPathImmutable(f)) ?? [];
 
         // Immutable files that were in this mutableWorkspace have to be moved
         // to a (potentially) new workspace (with the old path).
@@ -374,38 +366,40 @@ export class WorkspaceFactory {
         // Immutable files from a different workspace (with the same path as the new path)
         // have to be moved to the mutable workspace (which now has the new path)
         if (exitingWorkspaceWithSamePath) {
-            this.moveFiles(Array.from(newPathFiles), exitingWorkspaceWithSamePath!, mutableWorkspace);
+            this.moveFiles(newPathFiles, exitingWorkspaceWithSamePath!, mutableWorkspace);
             this.removeUnused(exitingWorkspaceWithSamePath);
         }
     }
 
-    private _add(
-        rootUri: string,
-        rootPath: string,
+    private _add<T extends Uri | undefined>(
+        rootUri: T,
         name: string,
-        pythonPath: string | undefined,
+        pythonPath: Uri | undefined,
         pythonPathKind: WorkspacePythonPathKind,
         kinds: string[]
-    ) {
+    ): ConditionalWorkspaceReturnType<T> {
+        const uri = rootUri ?? Uri.empty();
+
         // Update the kind based if the uri is local or not
-        if (!kinds.includes(WellKnownWorkspaceKinds.Default) && (!this._uriParser.isLocal(rootUri) || this._isWeb)) {
+        if (!kinds.includes(WellKnownWorkspaceKinds.Default) && (!uri.isLocal() || this._isWeb)) {
             // Web based workspace should be limited.
             kinds = [...kinds, WellKnownWorkspaceKinds.Limited];
         }
 
         const result: Workspace = {
             workspaceName: name,
-            rootPath,
-            uri: rootUri,
+            rootUri,
             kinds,
             pythonPath,
             pythonPathKind,
-            service: this._createService(name, rootPath, rootUri, kinds),
+            service: this._createService(name, uri, kinds),
             disableLanguageServices: false,
+            disableTaggedHints: false,
             disableOrganizeImports: false,
             disableWorkspaceSymbol: false,
             isInitialized: createInitStatus(),
             searchPathsToWatch: [],
+            pythonEnvironmentName: pythonPath?.toString(),
         };
 
         // Stick in our map
@@ -421,7 +415,7 @@ export class WorkspaceFactory {
         // workspace is still in the map.
         this._onWorkspaceCreated(result);
 
-        return result;
+        return result as ConditionalWorkspaceReturnType<T>;
     }
 
     private _remove(value: Workspace) {
@@ -429,14 +423,19 @@ export class WorkspaceFactory {
         const workspace = this._map.get(key);
         if (workspace) {
             workspace.isInitialized.resolve();
+
+            this._onWorkspaceRemoved(workspace);
+
             workspace.service.dispose();
             this._console.log(`WorkspaceFactory ${this._id} remove ${key}`);
             this._map.delete(key);
         }
     }
 
-    private _getDefaultWorskpaceKey(pythonPath: string | undefined) {
-        return `${this._defaultWorkspacePath}:${pythonPath ? pythonPath : WorkspacePythonPathKind.Mutable}`;
+    private _getDefaultWorkspaceKey(pythonPath: Uri | undefined) {
+        return `${this._defaultWorkspacePath}:${
+            !Uri.isEmpty(pythonPath) ? pythonPath : WorkspacePythonPathKind.Mutable
+        }`;
     }
 
     private _getWorkspaceKey(value: Workspace) {
@@ -444,7 +443,7 @@ export class WorkspaceFactory {
         // without a root path
         const rootPath = value.kinds.includes(WellKnownWorkspaceKinds.Default)
             ? this._defaultWorkspacePath
-            : value.rootPath;
+            : value.rootUri;
 
         // Key is defined by the rootPath and the pythonPath. We might include platform in this, but for now
         // platform is only used by the import resolver.
@@ -453,37 +452,34 @@ export class WorkspaceFactory {
         }`;
     }
 
-    private async _getOrCreateBestWorkspaceForFile(
-        filePath: string,
-        pythonPath: string | undefined
-    ): Promise<Workspace> {
+    private async _getOrCreateBestWorkspaceForFile(uri: Uri, pythonPath: Uri | undefined): Promise<Workspace> {
         // Find the current best workspace (without creating a new one)
-        let bestInstance = this._getBestWorkspaceForFile(filePath, pythonPath);
+        let bestInstance = this._getBestWorkspaceForFile(uri, pythonPath);
 
         // Make sure the best instance is initialized so that it has its pythonPath.
         await bestInstance.isInitialized.promise;
 
         // If this best instance doesn't match the pythonPath, then we need to create a new one.
-        if (pythonPath !== undefined && bestInstance.pythonPath !== pythonPath) {
-            bestInstance = this._createImmutableCopy(bestInstance, pythonPath);
+        if (!Uri.isEmpty(pythonPath) && !bestInstance.pythonPath?.equals(pythonPath)) {
+            bestInstance = this._createImmutableCopy(bestInstance, pythonPath!);
         }
 
         return bestInstance;
     }
 
-    private _getOrCreateBestWorkspaceFileSync(filePath: string, pythonPath: string | undefined) {
+    private _getOrCreateBestWorkspaceFileSync(uri: Uri, pythonPath: Uri | undefined) {
         // Find the current best workspace (without creating a new one)
-        let bestInstance = this._getBestWorkspaceForFile(filePath, pythonPath);
+        let bestInstance = this._getBestWorkspaceForFile(uri, pythonPath);
 
         // If this best instance doesn't match the pythonPath, then we need to create a new one.
-        if (pythonPath !== undefined && bestInstance.pythonPath !== pythonPath) {
-            bestInstance = this._createImmutableCopy(bestInstance, pythonPath);
+        if (!Uri.isEmpty(pythonPath) && !bestInstance.pythonPath?.equals(pythonPath)) {
+            bestInstance = this._createImmutableCopy(bestInstance, pythonPath!);
         }
 
         return bestInstance;
     }
 
-    private _mimicOpenFiles(source: Workspace, dest: Workspace, predicate: (f: string) => boolean) {
+    private _mimicOpenFiles(source: Workspace, dest: Workspace, predicate: (f: Uri) => boolean) {
         // All mutable open files in the first workspace should be opened in the new workspace.
         // Immutable files should stay where they are since they're tied to a specific workspace.
         const files = source.service.getOpenFiles().filter((f) => !this._isPythonPathImmutable(f));
@@ -497,17 +493,15 @@ export class WorkspaceFactory {
                     sourceFile.getClientVersion() || null,
                     fileContents || '',
                     sourceFile.getIPythonMode(),
-                    sourceFileInfo.chainedSourceFile?.sourceFile.getFilePath(),
-                    sourceFile.getRealFilePath()
+                    sourceFileInfo.chainedSourceFile?.sourceFile.getUri()
                 );
             }
         }
     }
 
-    private _createImmutableCopy(workspace: Workspace, pythonPath: string): Workspace {
+    private _createImmutableCopy(workspace: AllWorkspace, pythonPath: Uri): Workspace {
         const result = this._add(
-            workspace.uri,
-            workspace.rootPath,
+            workspace.rootUri,
             workspace.workspaceName,
             pythonPath,
             WorkspacePythonPathKind.Immutable,
@@ -520,7 +514,7 @@ export class WorkspaceFactory {
         return result;
     }
 
-    private _getBestWorkspaceForFile(filePath: string, pythonPath: string | undefined): Workspace {
+    private _getBestWorkspaceForFile(uri: Uri, pythonPath: Uri | undefined): Workspace {
         let bestInstance: Workspace | undefined;
 
         // The order of how we find the best matching workspace for the given file is
@@ -534,27 +528,37 @@ export class WorkspaceFactory {
         // 5. If none of the above works, then it matches the default workspace.
 
         // First find the workspaces that are tracking the file
-        const regularWorkspaces = this.getNonDefaultWorkspaces(WellKnownWorkspaceKinds.Regular);
-        const trackingWorkspaces = this.items().filter((w) => w.service.isTracked(filePath));
+        const trackingWorkspaces = this.items()
+            .filter((w) => w.service.isTracked(uri))
+            .filter(isNormalWorkspace);
 
         // Then find the best in all of those that actually matches the pythonPath.
         bestInstance = this._getBestRegularWorkspace(trackingWorkspaces, pythonPath);
 
+        const regularWorkspaces = this.getNonDefaultWorkspaces(WellKnownWorkspaceKinds.Regular);
+
         // If it's not in a tracked workspace, see if we only have regular workspaces with the same
-        // length root path
+        // length root path (basically, the same workspace with just different python paths)
         if (
             bestInstance === undefined &&
-            regularWorkspaces.every((w) => w.rootPath.length === regularWorkspaces[0].rootPath.length)
+            regularWorkspaces.every(
+                (w) =>
+                    w.rootUri.scheme === regularWorkspaces[0].rootUri.scheme &&
+                    (w.rootUri.scheme === uri.scheme || uri.isUntitled()) &&
+                    w.rootUri.equals(regularWorkspaces[0].rootUri)
+            )
         ) {
             bestInstance = this._getBestRegularWorkspace(regularWorkspaces, pythonPath);
         }
 
-        // If the regular workspaces don't all have the same length, then try the workspaces that already have the file open or scanned.
-        if (bestInstance === undefined) {
-            bestInstance = this._getBestRegularWorkspace(
-                regularWorkspaces.filter((w) => w.service.hasSourceFile(filePath)),
-                pythonPath
-            );
+        // If the regular workspaces don't all have the same length or they don't
+        // actually match on the python path, then try the workspaces that already have the file open or scanned.
+        if (bestInstance === undefined || !bestInstance.pythonPath?.equals(pythonPath)) {
+            bestInstance =
+                this._getBestRegularWorkspace(
+                    regularWorkspaces.filter((w) => w.service.hasSourceFile(uri) && w.rootUri.scheme === uri.scheme),
+                    pythonPath
+                ) || bestInstance;
         }
 
         // If that still didn't work, that must mean we don't have a workspace. Create a default one.
@@ -565,18 +569,17 @@ export class WorkspaceFactory {
         return bestInstance;
     }
 
-    private _getOrCreateDefaultWorkspace(pythonPath: string | undefined): Workspace {
+    private _getOrCreateDefaultWorkspace(pythonPath: Uri | undefined): DefaultWorkspace {
         // Default key depends upon the pythonPath
-        let defaultWorkspace = this._map.get(this._getDefaultWorskpaceKey(pythonPath));
+        let defaultWorkspace = this._map.get(this._getDefaultWorkspaceKey(pythonPath)) as DefaultWorkspace;
         if (!defaultWorkspace) {
             // Create a default workspace for files that are outside
             // of all workspaces.
             defaultWorkspace = this._add(
-                '',
-                '',
+                undefined,
                 this._defaultWorkspacePath,
                 pythonPath,
-                pythonPath !== undefined ? WorkspacePythonPathKind.Immutable : WorkspacePythonPathKind.Mutable,
+                !Uri.isEmpty(pythonPath) ? WorkspacePythonPathKind.Immutable : WorkspacePythonPathKind.Mutable,
                 [WellKnownWorkspaceKinds.Default]
             );
         }
@@ -584,21 +587,21 @@ export class WorkspaceFactory {
         return defaultWorkspace;
     }
 
-    private _getLongestPathWorkspace(workspaces: Workspace[]): Workspace {
+    private _getLongestPathWorkspace(workspaces: NormalWorkspace[]): NormalWorkspace {
         const longestPath = workspaces.reduce((previousPath, currentWorkspace) => {
             if (!previousPath) {
-                return currentWorkspace.rootPath;
+                return currentWorkspace.rootUri;
             }
-            if (currentWorkspace.rootPath.length > previousPath.length) {
-                return currentWorkspace.rootPath;
+            if (currentWorkspace.rootUri.getPathLength() > previousPath.getPathLength()) {
+                return currentWorkspace.rootUri;
             }
 
             return previousPath;
-        }, '');
-        return workspaces.find((w) => w.rootPath === longestPath)!;
+        }, Uri.empty());
+        return workspaces.find((w) => w.rootUri.equals(longestPath))!;
     }
 
-    private _getBestRegularWorkspace(workspaces: Workspace[], pythonPath?: string): Workspace | undefined {
+    private _getBestRegularWorkspace(workspaces: NormalWorkspace[], pythonPath?: Uri): NormalWorkspace | undefined {
         if (workspaces.length === 0) {
             return undefined;
         }
@@ -609,8 +612,8 @@ export class WorkspaceFactory {
         }
 
         // If there's any that match the python path, take the one with the longest path from those.
-        if (pythonPath !== undefined) {
-            const matchingWorkspaces = workspaces.filter((w) => w.pythonPath === pythonPath);
+        if (!Uri.isEmpty(pythonPath)) {
+            const matchingWorkspaces = workspaces.filter((w) => Uri.equals(w.pythonPath, pythonPath));
             if (matchingWorkspaces.length > 0) {
                 return this._getLongestPathWorkspace(matchingWorkspaces);
             }
@@ -619,4 +622,16 @@ export class WorkspaceFactory {
         // Otherwise, just take the longest path.
         return this._getLongestPathWorkspace(workspaces);
     }
+}
+
+interface DefaultWorkspace extends Workspace {
+    rootUri: undefined;
+}
+
+type AllWorkspace = DefaultWorkspace | NormalWorkspace;
+
+type ConditionalWorkspaceReturnType<T> = T extends undefined ? DefaultWorkspace : NormalWorkspace;
+
+function isNormalWorkspace(workspace: AllWorkspace): workspace is NormalWorkspace {
+    return !!workspace.rootUri;
 }

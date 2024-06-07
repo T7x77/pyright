@@ -8,43 +8,85 @@
 
 import * as os from 'os';
 
-import {
-    combinePaths,
-    ensureTrailingDirectorySeparator,
-    getPathComponents,
-    hasTrailingDirectorySeparator,
-} from './pathUtils';
+import { Workspace, WorkspaceFolder } from '../workspaceFactory';
+import { Uri } from './uri/uri';
+import { isRootedDiskPath, normalizeSlashes } from './pathUtils';
+import { ServiceKeys } from './serviceKeys';
+
+export function resolvePathWithEnvVariables(
+    workspace: Workspace,
+    path: string,
+    workspaces: Workspace[]
+): Uri | undefined {
+    const rootUri = workspace.rootUri;
+
+    const expanded = expandPathVariables(path, rootUri ?? Uri.empty(), workspaces);
+    const caseDetector = workspace.service.serviceProvider.get(ServiceKeys.caseSensitivityDetector);
+    if (maybeUri(expanded)) {
+        // If path is expanded to uri, no need to resolve it against the workspace root.
+        return Uri.parse(normalizeSlashes(expanded, '/'), caseDetector);
+    }
+
+    if (rootUri) {
+        // normal case, resolve the path against workspace root.
+        return rootUri.resolvePaths(normalizeSlashes(expanded, '/'));
+    }
+
+    // We don't have workspace root. but path contains something that require `workspace root`
+    if (path.includes('${workspaceFolder')) {
+        return undefined;
+    }
+
+    // Without workspace root, we can't handle any `relative path`.
+    if (!isRootedDiskPath(normalizeSlashes(expanded))) {
+        return undefined;
+    }
+
+    // We have absolute file path.
+    return Uri.file(expanded, caseDetector);
+}
 
 // Expands certain predefined variables supported within VS Code settings.
 // Ideally, VS Code would provide an API for doing this expansion, but
 // it doesn't. We'll handle the most common variables here as a convenience.
-export function expandPathVariables(rootPath: string, path: string): string {
-    const pathParts = getPathComponents(path);
+export function expandPathVariables(path: string, rootPath: Uri, workspaces: WorkspaceFolder[]): string {
+    // Make sure all replacements look like URI paths too.
+    const replace = (match: RegExp, replaceValue: string) => {
+        path = path.replace(match, replaceValue);
+    };
 
-    const expandedParts: string[] = [];
-    for (const part of pathParts) {
-        const trimmedPart = part.trim();
+    // Replace everything inline.
+    path = path.replace(/\$\{workspaceFolder\}/g, rootPath.getPath());
 
-        if (trimmedPart === '${workspaceFolder}') {
-            expandedParts.push(rootPath);
-        } else if (trimmedPart === '${env:HOME}' && process.env.HOME !== undefined) {
-            expandedParts.push(process.env.HOME);
-        } else if (trimmedPart === '${env:USERNAME}' && process.env.USERNAME !== undefined) {
-            expandedParts.push(process.env.USERNAME);
-        } else if (trimmedPart === '${env:VIRTUAL_ENV}' && process.env.VIRTUAL_ENV !== undefined) {
-            expandedParts.push(process.env.VIRTUAL_ENV);
-        } else if (trimmedPart === '~' && os.homedir) {
-            expandedParts.push(os.homedir() || process.env.HOME || process.env.USERPROFILE || '~');
-        } else {
-            expandedParts.push(part);
+    // this is for vscode multiroot workspace supports.
+    // https://code.visualstudio.com/docs/editor/variables-reference#_variables-scoped-per-workspace-folder
+    for (const workspace of workspaces) {
+        if (!workspace.rootUri) {
+            continue;
         }
+
+        const ws_regexp = RegExp(`\\$\\{workspaceFolder:${workspace.workspaceName}\\}`, 'g');
+        path = path.replace(ws_regexp, workspace.rootUri.getPath());
+    }
+    if (process.env.HOME !== undefined) {
+        replace(/\$\{env:HOME\}/g, process.env.HOME || '');
+    }
+    if (process.env.USERNAME !== undefined) {
+        replace(/\$\{env:USERNAME\}/g, process.env.USERNAME || '');
+    }
+    if (process.env.VIRTUAL_ENV !== undefined) {
+        replace(/\$\{env:VIRTUAL_ENV\}/g, process.env.VIRTUAL_ENV || '');
+    }
+    if (os.homedir) {
+        replace(/(?:^|\/)~(?=\/)/g, os.homedir() || process.env.HOME || process.env.USERPROFILE || '~');
     }
 
-    if (expandedParts.length === 0) {
-        return path;
-    }
+    return path;
+}
 
-    const root = expandedParts.shift()!;
-    const expandedPath = combinePaths(root, ...expandedParts);
-    return hasTrailingDirectorySeparator(path) ? ensureTrailingDirectorySeparator(expandedPath) : expandedPath;
+function maybeUri(value: string) {
+    const windows = /^[a-zA-Z]:\\?/;
+    const uri = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/?\/?/;
+
+    return uri.test(value) && !windows.test(value);
 }

@@ -8,21 +8,12 @@
  */
 
 import assert from 'assert';
-import * as os from 'os';
 import * as path from 'path';
 
-import { Comparison } from '../common/core';
-import { expandPathVariables } from '../common/envVarUtils';
 import {
-    changeAnyExtension,
     combinePathComponents,
     combinePaths,
-    comparePaths,
-    comparePathsCaseInsensitive,
-    comparePathsCaseSensitive,
     containsPath,
-    convertUriToPath,
-    deduplicateFolders,
     ensureTrailingDirectorySeparator,
     getAnyExtensionFromPath,
     getBaseFileName,
@@ -30,12 +21,11 @@ import {
     getFileName,
     getPathComponents,
     getRelativePath,
-    getRelativePathFromDirectory,
+    getRootLength,
     getWildcardRegexPattern,
     getWildcardRoot,
     hasTrailingDirectorySeparator,
     isDirectoryWildcardPatternPresent,
-    isFileSystemCaseSensitiveInternal,
     isRootedDiskPath,
     normalizeSlashes,
     reducePathComponents,
@@ -43,7 +33,6 @@ import {
     stripFileExtension,
     stripTrailingDirectorySeparator,
 } from '../common/pathUtils';
-import * as vfs from './harness/vfs/filesystem';
 
 test('getPathComponents1', () => {
     const components = getPathComponents('');
@@ -80,9 +69,36 @@ test('getPathComponents5', () => {
     assert.equal(components[1], 'hello.py');
 });
 
+test('getPathComponents6', () => {
+    const components = getPathComponents(fixSeparators('//server/share/dir/file.py'));
+    assert.equal(components.length, 4);
+    assert.equal(components[0], fixSeparators('//server/'));
+    assert.equal(components[1], 'share');
+    assert.equal(components[2], 'dir');
+    assert.equal(components[3], 'file.py');
+});
+
+test('getPathComponents7', () => {
+    const components = getPathComponents('ab:cdef/test');
+    assert.equal(components.length, 3);
+    assert.equal(components[0], '');
+    assert.equal(components[1], 'ab:cdef');
+    assert.equal(components[2], 'test');
+});
+
 test('combinePaths1', () => {
     const p = combinePaths('/user', '1', '2', '3');
     assert.equal(p, normalizeSlashes('/user/1/2/3'));
+});
+
+test('combinePaths2', () => {
+    const p = combinePaths('/foo', 'ab:c');
+    assert.equal(p, normalizeSlashes('/foo/ab:c'));
+});
+
+test('combinePaths3', () => {
+    const p = combinePaths('untitled:foo', 'ab:c');
+    assert.equal(p, normalizeSlashes('untitled:foo/ab:c'));
 });
 
 test('ensureTrailingDirectorySeparator1', () => {
@@ -163,6 +179,13 @@ test('getWildcardRegexPattern3', () => {
     assert.ok(!regex.test(fixSeparators('/users/me/.blah/foo.py')));
 });
 
+test('getWildcardRegexPattern4', () => {
+    const pattern = getWildcardRegexPattern('//server/share/dir', '.');
+    const regex = new RegExp(pattern);
+    assert.ok(regex.test(fixSeparators('//server/share/dir/foo.py')));
+    assert.ok(!regex.test(fixSeparators('//server/share/dix/foo.py')));
+});
+
 test('isDirectoryWildcardPatternPresent1', () => {
     const isPresent = isDirectoryWildcardPatternPresent('./**/*.py');
     assert.equal(isPresent, true);
@@ -231,52 +254,6 @@ test('resolvePath2', () => {
     assert.equal(resolvePaths('/path', 'to', '..', 'from', 'file.ext/'), normalizeSlashes('/path/from/file.ext/'));
 });
 
-test('resolvePath3 ~ escape', () => {
-    const homedir = os.homedir();
-    assert.equal(
-        resolvePaths(expandPathVariables('', '~/path'), 'to', '..', 'from', 'file.ext/'),
-        normalizeSlashes(`${homedir}/path/from/file.ext/`)
-    );
-});
-
-test('resolvePath4 ~ escape in middle', () => {
-    const homedir = os.homedir();
-    assert.equal(
-        resolvePaths('/path', expandPathVariables('', '~/file.ext/')),
-        normalizeSlashes(`${homedir}/file.ext/`)
-    );
-});
-
-test('invalid ~ without root', () => {
-    const path = combinePaths('Library', 'Mobile Documents', 'com~apple~CloudDocs', 'Development', 'mysuperproject');
-    assert.equal(resolvePaths(expandPathVariables('/src', path)), path);
-});
-
-test('invalid ~ with root', () => {
-    const path = combinePaths('/', 'Library', 'com~apple~CloudDocs', 'Development', 'mysuperproject');
-    assert.equal(resolvePaths(expandPathVariables('/src', path)), path);
-});
-
-test('comparePaths1', () => {
-    assert.equal(comparePaths('/A/B/C', '\\a\\b\\c'), Comparison.LessThan);
-});
-
-test('comparePaths2', () => {
-    assert.equal(comparePaths('/A/B/C', '\\a\\b\\c', true), Comparison.EqualTo);
-});
-
-test('comparePaths3', () => {
-    assert.equal(comparePaths('/A/B/C', '/a/c/../b/./c', true), Comparison.EqualTo);
-});
-
-test('comparePaths4', () => {
-    assert.equal(comparePaths('/a/b/c', '/a/c/../b/./c', 'current\\path\\', false), Comparison.EqualTo);
-});
-
-test('comparePaths5', () => {
-    assert.equal(comparePaths('/a/b/c/', '/a/b/c'), Comparison.EqualTo);
-});
-
 test('containsPath1', () => {
     assert.equal(containsPath('/a/b/c/', '/a/d/../b/c/./d'), true);
 });
@@ -287,22 +264,6 @@ test('containsPath2', () => {
 
 test('containsPath3', () => {
     assert.equal(containsPath('/a', '/A/B', true), true);
-});
-
-test('changeAnyExtension1', () => {
-    assert.equal(changeAnyExtension('/path/to/file.ext', '.js', ['.ext', '.ts'], true), '/path/to/file.js');
-});
-
-test('changeAnyExtension2', () => {
-    assert.equal(changeAnyExtension('/path/to/file.ext', '.js'), '/path/to/file.js');
-});
-
-test('changeAnyExtension3', () => {
-    assert.equal(changeAnyExtension('/path/to/file.ext', '.js', '.ts', false), '/path/to/file.ext');
-});
-
-test('changeAnyExtension1', () => {
-    assert.equal(getAnyExtensionFromPath('/path/to/file.ext'), '.ext');
 });
 
 test('changeAnyExtension2', () => {
@@ -329,20 +290,32 @@ test('getBaseFileName4', () => {
     assert.equal(getBaseFileName('/path/to/file.ext', ['.ext'], true), 'file');
 });
 
-test('getRelativePathFromDirectory1', () => {
-    assert.equal(getRelativePathFromDirectory('/a', '/a/b/c/d', true), normalizeSlashes('b/c/d'));
+test('getRootLength1', () => {
+    assert.equal(getRootLength('a'), 0);
 });
 
-test('getRelativePathFromDirectory2', () => {
-    assert.equal(getRelativePathFromDirectory('/a', '/b/c/d', true), normalizeSlashes('../b/c/d'));
+test('getRootLength2', () => {
+    assert.equal(getRootLength(fixSeparators('/')), 1);
 });
 
-test('comparePathsCaseSensitive', () => {
-    assert.equal(comparePathsCaseSensitive('/a/b/C', '/a/b/c'), Comparison.LessThan);
+test('getRootLength3', () => {
+    assert.equal(getRootLength('c:'), 2);
 });
 
-test('comparePathsCaseInsensitive', () => {
-    assert.equal(comparePathsCaseInsensitive('/a/b/C', '/a/b/c'), Comparison.EqualTo);
+test('getRootLength4', () => {
+    assert.equal(getRootLength('c:d'), 0);
+});
+
+test('getRootLength5', () => {
+    assert.equal(getRootLength(fixSeparators('c:/')), 3);
+});
+
+test('getRootLength6', () => {
+    assert.equal(getRootLength(fixSeparators('//server')), 8);
+});
+
+test('getRootLength7', () => {
+    assert.equal(getRootLength(fixSeparators('//server/share')), 9);
 });
 
 test('isRootedDiskPath1', () => {
@@ -366,7 +339,11 @@ test('isDiskPathRoot2', () => {
 });
 
 test('isDiskPathRoot3', () => {
-    assert(!isRootedDiskPath(normalizeSlashes('c:')));
+    assert(isRootedDiskPath(normalizeSlashes('c:')));
+});
+
+test('isDiskPathRoot4', () => {
+    assert(!isRootedDiskPath(normalizeSlashes('c:d')));
 });
 
 test('getRelativePath', () => {
@@ -374,45 +351,4 @@ test('getRelativePath', () => {
         getRelativePath(normalizeSlashes('/a/b/c/d/e/f'), normalizeSlashes('/a/b/c')),
         normalizeSlashes('./d/e/f')
     );
-});
-
-test('CaseSensitivity', () => {
-    const cwd = normalizeSlashes('/');
-
-    const fsCaseInsensitive = new vfs.TestFileSystem(/*ignoreCase*/ true, { cwd });
-    assert.equal(isFileSystemCaseSensitiveInternal(fsCaseInsensitive), false);
-
-    const fsCaseSensitive = new vfs.TestFileSystem(/*ignoreCase*/ false, { cwd });
-    assert.equal(isFileSystemCaseSensitiveInternal(fsCaseSensitive), true);
-});
-
-test('deduplicateFolders', () => {
-    const listOfFolders = [
-        ['/user', '/user/temp', '/xuser/app', '/lib/python', '/home/p/.venv/lib/site-packages'],
-        ['/user', '/user/temp', '/xuser/app', '/lib/python/Python310.zip', '/home/z/.venv/lib/site-packages'],
-        ['/main/python/lib/site-packages', '/home/p'],
-    ];
-
-    const folders = deduplicateFolders(listOfFolders);
-
-    const expected = [
-        '/user',
-        '/xuser/app',
-        '/lib/python',
-        '/home/z/.venv/lib/site-packages',
-        '/main/python/lib/site-packages',
-        '/home/p',
-    ];
-
-    assert.deepStrictEqual(folders.sort(), expected.sort());
-});
-
-test('convert UNC path', () => {
-    const cwd = normalizeSlashes('/');
-    const fs = new vfs.TestFileSystem(/*ignoreCase*/ true, { cwd });
-
-    const path = convertUriToPath(fs, 'file://server/c$/folder/file.py');
-
-    // When converting UNC path, server part shouldn't be removed.
-    assert(path.indexOf('server') > 0);
 });

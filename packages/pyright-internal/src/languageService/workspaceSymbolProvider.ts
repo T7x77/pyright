@@ -3,19 +3,20 @@
  * Copyright (c) Microsoft Corporation.
  * Licensed under the MIT license.
  *
- * Provide LSP's workspace symbol functionality.
+ * Provide langue server workspace symbol functionality.
  */
 
 import { CancellationToken, Location, ResultProgressReporter, SymbolInformation } from 'vscode-languageserver';
-import { throwIfCancellationRequested } from '../common/cancellationUtils';
-import * as StringUtils from '../common/stringUtils';
-import { IndexSymbolData, SymbolIndexer } from './symbolIndexer';
-import { ProgramView } from '../common/extensibility';
-import { isUserCode } from '../analyzer/sourceFileInfoUtils';
 import { getFileInfo } from '../analyzer/analyzerNodeInfo';
-import { convertPathToUri } from '../common/pathUtils';
-import { Workspace } from '../workspaceFactory';
+import { isUserCode } from '../analyzer/sourceFileInfoUtils';
+import { throwIfCancellationRequested } from '../common/cancellationUtils';
 import { appendArray } from '../common/collectionUtils';
+import { ProgramView } from '../common/extensibility';
+import * as StringUtils from '../common/stringUtils';
+import { Uri } from '../common/uri/uri';
+import { convertUriToLspUriString } from '../common/uri/uriUtils';
+import { Workspace } from '../workspaceFactory';
+import { IndexSymbolData, SymbolIndexer } from './symbolIndexer';
 
 type WorkspaceSymbolCallback = (symbols: SymbolInformation[]) => void;
 
@@ -55,21 +56,26 @@ export class WorkspaceSymbolProvider {
         return this._allSymbols;
     }
 
-    protected getSymbolsForDocument(program: ProgramView, filePath: string): SymbolInformation[] {
+    protected getSymbolsForDocument(program: ProgramView, fileUri: Uri): SymbolInformation[] {
         const symbolList: SymbolInformation[] = [];
 
-        const parseResults = program.getParseResults(filePath);
+        const parseResults = program.getParseResults(fileUri);
         if (!parseResults) {
             return symbolList;
         }
 
-        const fileInfo = getFileInfo(parseResults.parseTree);
+        const fileInfo = getFileInfo(parseResults.parserOutput.parseTree);
         if (!fileInfo) {
             return symbolList;
         }
 
-        const indexSymbolData = SymbolIndexer.indexSymbols(fileInfo, parseResults, this._token);
-        this.appendWorkspaceSymbolsRecursive(indexSymbolData, program, filePath, '', symbolList);
+        const indexSymbolData = SymbolIndexer.indexSymbols(
+            fileInfo,
+            parseResults,
+            { includeAliases: false },
+            this._token
+        );
+        this.appendWorkspaceSymbolsRecursive(indexSymbolData, program, fileUri, '', symbolList);
 
         return symbolList;
     }
@@ -77,7 +83,7 @@ export class WorkspaceSymbolProvider {
     protected appendWorkspaceSymbolsRecursive(
         indexSymbolData: IndexSymbolData[] | undefined,
         program: ProgramView,
-        filePath: string,
+        fileUri: Uri,
         container: string,
         symbolList: SymbolInformation[]
     ) {
@@ -94,7 +100,7 @@ export class WorkspaceSymbolProvider {
 
             if (StringUtils.isPatternInSymbol(this._query, symbolData.name)) {
                 const location: Location = {
-                    uri: convertPathToUri(program.fileSystem, filePath),
+                    uri: convertUriToLspUriString(program.fileSystem, fileUri),
                     range: symbolData.selectionRange!,
                 };
 
@@ -114,7 +120,7 @@ export class WorkspaceSymbolProvider {
             this.appendWorkspaceSymbolsRecursive(
                 symbolData.children,
                 program,
-                filePath,
+                fileUri,
                 this._getContainerName(container, symbolData.name),
                 symbolList
             );
@@ -134,7 +140,7 @@ export class WorkspaceSymbolProvider {
                 continue;
             }
 
-            const symbolList = this.getSymbolsForDocument(program, sourceFileInfo.sourceFile.getFilePath());
+            const symbolList = this.getSymbolsForDocument(program, sourceFileInfo.sourceFile.getUri());
             if (symbolList.length > 0) {
                 this._reporter(symbolList);
             }

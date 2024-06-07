@@ -16,13 +16,13 @@ import {
     getClassDocString,
     getFunctionDocStringInherited,
     getModuleDocString,
-    getModuleDocStringFromPaths,
+    getModuleDocStringFromUris,
     getOverloadedFunctionDocStringsInherited,
     getPropertyDocStringInherited,
     getVariableDocString,
 } from '../analyzer/typeDocStringUtils';
 import { TypeEvaluator } from '../analyzer/typeEvaluatorTypes';
-import { ClassMemberLookupFlags, lookUpClassMember } from '../analyzer/typeUtils';
+import { MemberAccessFlags, lookUpClassMember } from '../analyzer/typeUtils';
 import {
     ClassType,
     FunctionType,
@@ -213,22 +213,35 @@ function getDocumentationPartForTypeAlias(
     evaluator: TypeEvaluator,
     symbol?: Symbol
 ) {
-    if (resolvedDecl?.type === DeclarationType.Variable && resolvedDecl.typeAliasName && resolvedDecl.docString) {
+    if (!resolvedDecl) {
+        return undefined;
+    }
+
+    if (resolvedDecl.type === DeclarationType.TypeAlias) {
         return resolvedDecl.docString;
-    } else if (resolvedDecl?.type === DeclarationType.Variable) {
+    }
+
+    if (resolvedDecl.type === DeclarationType.Variable) {
+        if (resolvedDecl.typeAliasName && resolvedDecl.docString) {
+            return resolvedDecl.docString;
+        }
+
         const decl = (symbol?.getDeclarations().find((d) => d.type === DeclarationType.Variable && !!d.docString) ??
             resolvedDecl) as VariableDeclaration;
         const doc = getVariableDocString(decl, sourceMapper);
         if (doc) {
             return doc;
         }
-    } else if (resolvedDecl?.type === DeclarationType.Function) {
+    }
+
+    if (resolvedDecl.type === DeclarationType.Function) {
         // @property functions
         const doc = getPropertyDocStringInherited(resolvedDecl, sourceMapper, evaluator);
         if (doc) {
             return doc;
         }
     }
+
     return undefined;
 }
 
@@ -310,7 +323,7 @@ export function getDocumentationPartsForTypeAndDecl(
             }
         }
 
-        typeDoc = getModuleDocStringFromPaths([resolvedDecl.path], sourceMapper);
+        typeDoc = getModuleDocStringFromUris([resolvedDecl.uri], sourceMapper);
     }
 
     typeDoc =
@@ -400,7 +413,7 @@ export function getClassAndConstructorTypes(node: NameNode, evaluator: TypeEvalu
 
     // Try to get the `__init__` method first because it typically has more type information than `__new__`.
     // Don't exclude `object.__init__` since in the plain case we want to show Foo().
-    const initMember = lookUpClassMember(classType, '__init__', ClassMemberLookupFlags.SkipInstanceVariables);
+    const initMember = lookUpClassMember(classType, '__init__', MemberAccessFlags.SkipInstanceMembers);
 
     if (initMember) {
         const functionType = evaluator.getTypeOfMember(initMember);
@@ -421,7 +434,7 @@ export function getClassAndConstructorTypes(node: NameNode, evaluator: TypeEvalu
         const newMember = lookUpClassMember(
             classType,
             '__new__',
-            ClassMemberLookupFlags.SkipObjectBaseClass | ClassMemberLookupFlags.SkipInstanceVariables
+            MemberAccessFlags.SkipObjectBaseClass | MemberAccessFlags.SkipInstanceMembers
         );
 
         if (newMember) {
@@ -429,13 +442,13 @@ export function getClassAndConstructorTypes(node: NameNode, evaluator: TypeEvalu
 
             // Prefer `__new__` if it doesn't have default params (*args: Any, **kwargs: Any) or no params ().
             if (isFunction(newMemberType) || isOverloadedFunction(newMemberType)) {
-                // Set `treatConstructorAsClassMember` to true to exclude `cls` as a parameter.
+                // Set `treatConstructorAsClassMethod` to true to exclude `cls` as a parameter.
                 methodType = bindFunctionToClassOrObjectToolTip(
                     evaluator,
                     node,
                     instanceType,
                     newMemberType,
-                    /* treatConstructorAsClassMember */ true
+                    /* treatConstructorAsClassMethod */ true
                 );
             }
         }
@@ -449,15 +462,13 @@ export function bindFunctionToClassOrObjectToolTip(
     node: ExpressionNode,
     baseType: ClassType | undefined,
     memberType: FunctionType | OverloadedFunctionType,
-    treatConstructorAsClassMember?: boolean
+    treatConstructorAsClassMethod?: boolean
 ): FunctionType | OverloadedFunctionType | undefined {
     const methodType = evaluator.bindFunctionToClassOrObject(
         baseType,
         memberType,
         /* memberClass */ undefined,
-        /* errorNode */ undefined,
-        /* recursiveCount */ undefined,
-        treatConstructorAsClassMember
+        treatConstructorAsClassMethod
     );
 
     if (!methodType) {

@@ -1,6 +1,5 @@
 from collections.abc import Callable, Mapping
-from typing import Any
-from typing_extensions import Literal
+from typing import Any, Literal
 
 def get_host_platform() -> str: ...
 def get_platform() -> str: ...
@@ -14,17 +13,21 @@ def subst_vars(s: str, local_vars: Mapping[str, str]) -> None: ...
 def grok_environment_error(exc: object, prefix: str = ...) -> str: ...
 def split_quoted(s: str) -> list[str]: ...
 def execute(
-    func: Callable[..., object], args: tuple[Any, ...], msg: str | None = ..., verbose: bool = ..., dry_run: bool = ...
+    func: Callable[..., object],
+    args: tuple[Any, ...],
+    msg: str | None = ...,
+    verbose: bool | Literal[0, 1] = 0,
+    dry_run: bool | Literal[0, 1] = 0,
 ) -> None: ...
 def strtobool(val: str) -> Literal[0, 1]: ...
 def byte_compile(
     py_files: list[str],
     optimize: int = ...,
-    force: bool = ...,
+    force: bool | Literal[0, 1] = 0,
     prefix: str | None = ...,
     base_dir: str | None = ...,
-    verbose: bool = ...,
-    dry_run: bool = ...,
+    verbose: bool | Literal[0, 1] = 1,
+    dry_run: bool | Literal[0, 1] = 0,
     direct: bool | None = ...,
 ) -> None: ...
 def rfc822_escape(header: str) -> str: ...

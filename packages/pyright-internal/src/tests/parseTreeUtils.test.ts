@@ -22,10 +22,11 @@ import {
     isImportAlias,
     isImportModuleName,
     isLastNameOfDottedName,
+    printExpression,
 } from '../analyzer/parseTreeUtils';
-import { rangesAreEqual, TextRange } from '../common/textRange';
-import { MemberAccessNode, NameNode, ParseNodeType, StringNode } from '../parser/parseNodes';
-import { getNodeAtMarker, getNodeForRange, parseAndGetTestState, TestState } from './harness/fourslash/testState';
+import { TextRange, rangesAreEqual } from '../common/textRange';
+import { MemberAccessNode, NameNode, ParseNodeType, StringNode, isExpressionNode } from '../parser/parseNodes';
+import { TestState, getNodeAtMarker, getNodeForRange, parseAndGetTestState } from './harness/fourslash/testState';
 
 test('isImportModuleName', () => {
     const code = `
@@ -301,9 +302,25 @@ test('getFullStatementRange with only trailing blank lines', () => {
     testNodeRange(state, 'marker', ParseNodeType.Function, true);
 });
 
+test('printExpression', () => {
+    const code = `
+//// [|/*marker1*/not x|]
+//// [|/*marker2*/+x|]
+    `;
+    const state = parseAndGetTestState(code).state;
+    checkExpression('marker1', 'not x');
+    checkExpression('marker2', '+x');
+
+    function checkExpression(marker: string, expected: string) {
+        const node = getNodeAtMarker(state, marker);
+        assert(isExpressionNode(node));
+        assert.strictEqual(printExpression(node), expected);
+    }
+});
+
 function testNodeRange(state: TestState, markerName: string, type: ParseNodeType, includeTrailingBlankLines = false) {
     const range = state.getRangeByMarkerName(markerName)!;
-    const sourceFile = state.program.getBoundSourceFile(range.marker!.fileName)!;
+    const sourceFile = state.program.getBoundSourceFile(range.marker!.fileUri)!;
 
     const statementNode = getFirstAncestorOrSelfOfKind(getNodeAtMarker(state, markerName), type)!;
     const statementRange = getFullStatementRange(statementNode, sourceFile.getParseResults()!, {

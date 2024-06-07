@@ -13,33 +13,30 @@
  */
 
 import { appendArray } from '../common/collectionUtils';
+import { DiagnosticAddendum } from '../common/diagnostic';
 import { DiagnosticRule } from '../common/diagnosticRules';
-import { Localizer } from '../localization/localize';
+import { LocMessage } from '../localization/localize';
 import { ArgumentCategory, ExpressionNode, ParameterCategory } from '../parser/parseNodes';
-import { getFileInfo } from './analyzerNodeInfo';
 import { populateTypeVarContextBasedOnExpectedType } from './constraintSolver';
 import { applyConstructorTransform, hasConstructorTransform } from './constructorTransform';
 import { getTypeVarScopesForNode } from './parseTreeUtils';
+import { CallResult, FunctionArgument, TypeEvaluator, TypeResult } from './typeEvaluatorTypes';
 import {
-    CallResult,
-    ClassMemberLookup,
-    FunctionArgument,
-    MemberAccessFlags,
-    TypeEvaluator,
-    TypeResult,
-} from './typeEvaluatorTypes';
-import {
-    ClassMemberLookupFlags,
     InferenceContext,
+    MemberAccessFlags,
+    UniqueSignatureTracker,
     applySolvedTypeVars,
     buildTypeVarContextFromSpecializedClass,
     convertToInstance,
+    doForEachSignature,
     doForEachSubtype,
+    ensureFunctionSignaturesAreUnique,
+    getTypeVarArgumentsRecursive,
     getTypeVarScopeId,
-    isPartlyUnknown,
     isTupleClass,
     lookUpClassMember,
     mapSubtypes,
+    selfSpecializeClass,
     specializeTupleClass,
     transformPossibleRecursiveTypeAlias,
 } from './typeUtils';
@@ -51,17 +48,67 @@ import {
     InheritanceChain,
     OverloadedFunctionType,
     Type,
+    TypeVarType,
     UnknownType,
+    combineTypes,
+    findSubtype,
     isAny,
     isAnyOrUnknown,
+    isClass,
     isClassInstance,
     isFunction,
     isInstantiableClass,
     isNever,
     isOverloadedFunction,
     isTypeVar,
+    isUnion,
     isUnknown,
 } from './types';
+
+// Fetches and binds the __new__ method from a class.
+export function getBoundNewMethod(
+    evaluator: TypeEvaluator,
+    errorNode: ExpressionNode,
+    type: ClassType,
+    diag: DiagnosticAddendum | undefined = undefined,
+    additionalFlags = MemberAccessFlags.SkipObjectBaseClass
+) {
+    const flags =
+        MemberAccessFlags.SkipClassMembers |
+        MemberAccessFlags.SkipAttributeAccessOverride |
+        MemberAccessFlags.TreatConstructorAsClassMethod |
+        additionalFlags;
+
+    return evaluator.getTypeOfBoundMember(errorNode, type, '__new__', { method: 'get' }, diag, flags);
+}
+
+// Fetches and binds the __init__ method from a class instance.
+export function getBoundInitMethod(
+    evaluator: TypeEvaluator,
+    errorNode: ExpressionNode,
+    type: ClassType,
+    diag: DiagnosticAddendum | undefined = undefined,
+    additionalFlags = MemberAccessFlags.SkipObjectBaseClass
+) {
+    const flags =
+        MemberAccessFlags.SkipInstanceMembers | MemberAccessFlags.SkipAttributeAccessOverride | additionalFlags;
+
+    return evaluator.getTypeOfBoundMember(errorNode, type, '__init__', { method: 'get' }, diag, flags);
+}
+
+// Fetches and binds the __call__ method from a class or its metaclass.
+export function getBoundCallMethod(evaluator: TypeEvaluator, errorNode: ExpressionNode, type: ClassType) {
+    return evaluator.getTypeOfBoundMember(
+        errorNode,
+        type,
+        '__call__',
+        { method: 'get' },
+        /* diag */ undefined,
+        MemberAccessFlags.SkipInstanceMembers |
+            MemberAccessFlags.SkipTypeBaseClass |
+            MemberAccessFlags.SkipAttributeAccessOverride
+    );
+}
 
 // Matches the arguments of a call to the constructor for a class.
 // If successful, it returns the resulting (specialized) object type that
@@ -71,8 +118,9 @@ export function validateConstructorArguments(
     errorNode: ExpressionNode,
     argList: FunctionArgument[],
     type: ClassType,
-    skipUnknownArgCheck: boolean,
-    inferenceContext: InferenceContext | undefined
+    skipUnknownArgCheck: boolean | undefined,
+    inferenceContext: InferenceContext | undefined,
+    signatureTracker: UniqueSignatureTracker | undefined
 ): CallResult {
     const metaclassResult = validateMetaclassCall(
         evaluator,
@@ -80,40 +128,34 @@ export function validateConstructorArguments(
         argList,
         type,
         skipUnknownArgCheck,
-        inferenceContext
+        inferenceContext,
+        signatureTracker
     );
 
     if (metaclassResult) {
         const metaclassReturnType = metaclassResult.returnType ?? UnknownType.create();
 
         // If there a custom `__call__` method on the metaclass that returns
-        // something other than Any or an instance of the class, assume that it
+        // something other than an instance of the class, assume that it
         // overrides the normal `type.__call__` logic and don't perform the usual
         // __new__ and __init__ validation.
-        if (metaclassResult.argumentErrors || !evaluator.assignType(convertToInstance(type), metaclassReturnType)) {
+        if (metaclassResult.argumentErrors || shouldSkipNewAndInitEvaluation(evaluator, type, metaclassReturnType)) {
             return metaclassResult;
         }
     }
 
     // Determine whether the class overrides the object.__new__ method.
-    const newMethodTypeResult = evaluator.getTypeOfClassMemberName(
-        errorNode,
-        type,
-        /* isAccessedThroughObject */ false,
-        '__new__',
-        { method: 'get' },
-        /* diag */ undefined,
-        MemberAccessFlags.AccessClassMembersOnly |
-            MemberAccessFlags.SkipObjectBaseClass |
-            MemberAccessFlags.TreatConstructorAsClassMethod,
-        type
-    );
+    const newMethodDiag = new DiagnosticAddendum();
+    const newMethodTypeResult = getBoundNewMethod(evaluator, errorNode, type, newMethodDiag);
+    if (newMethodTypeResult?.typeErrors) {
+        evaluator.addDiagnostic(DiagnosticRule.reportGeneralTypeIssues, newMethodDiag.getString(), errorNode);
+    }
 
     const useConstructorTransform = hasConstructorTransform(type);
 
     // If there is a constructor transform, evaluate all arguments speculatively
     // so we can later re-evaluate them in the context of the transform.
-    let returnResult = evaluator.useSpeculativeMode(useConstructorTransform ? errorNode : undefined, () => {
+    const returnResult = evaluator.useSpeculativeMode(useConstructorTransform ? errorNode : undefined, () => {
         return validateNewAndInitMethods(
             evaluator,
             errorNode,
@@ -121,6 +163,7 @@ export function validateConstructorArguments(
             type,
             skipUnknownArgCheck,
             inferenceContext,
+            signatureTracker,
             newMethodTypeResult
         );
     });
@@ -140,16 +183,24 @@ export function validateConstructorArguments(
                 type,
                 skipUnknownArgCheck,
                 inferenceContext,
+                signatureTracker,
                 newMethodTypeResult
             );
 
             validatedArgExpressions = true;
         } else if (returnResult.returnType) {
-            const transformed = applyConstructorTransform(evaluator, errorNode, argList, type, {
-                argumentErrors: !!returnResult.argumentErrors,
-                returnType: returnResult.returnType,
-                isTypeIncomplete: !!returnResult.isTypeIncomplete,
-            });
+            const transformed = applyConstructorTransform(
+                evaluator,
+                errorNode,
+                argList,
+                type,
+                {
+                    argumentErrors: !!returnResult.argumentErrors,
+                    returnType: returnResult.returnType,
+                    isTypeIncomplete: !!returnResult.isTypeIncomplete,
+                },
+                signatureTracker
+            );
 
             returnResult.returnType = transformed.returnType;
 
@@ -175,21 +226,6 @@ export function validateConstructorArguments(
         });
     }
 
-    // Reconcile the metaclass __call__ return type and the __new__ return type.
-    // This is a heuristic because we have no way of knowing how these actually
-    // interact based on the method signatures alone.
-    if (metaclassResult?.returnType) {
-        // If the __new__ and __init__ methods returned `Any` or `Unknown` or `NoReturn`,
-        // use the metaclass return type instead.
-        if (!returnResult.returnType || isAnyOrUnknown(returnResult.returnType)) {
-            if (!isAnyOrUnknown(metaclassResult.returnType)) {
-                returnResult = { ...returnResult, returnType: metaclassResult.returnType };
-            }
-        } else if (returnResult.returnType && isNever(returnResult.returnType)) {
-            returnResult = { ...returnResult, returnType: metaclassResult.returnType };
-        }
-    }
-
     return returnResult;
 }
 
@@ -198,9 +234,10 @@ function validateNewAndInitMethods(
     errorNode: ExpressionNode,
     argList: FunctionArgument[],
     type: ClassType,
-    skipUnknownArgCheck: boolean,
+    skipUnknownArgCheck: boolean | undefined,
     inferenceContext: InferenceContext | undefined,
-    newMethodTypeResult: ClassMemberLookup | undefined
+    signatureTracker: UniqueSignatureTracker | undefined,
+    newMethodTypeResult: TypeResult | undefined
 ): CallResult {
     let returnType: Type | undefined;
     let validatedArgExpressions = false;
@@ -220,6 +257,7 @@ function validateNewAndInitMethods(
             type,
             skipUnknownArgCheck,
             inferenceContext,
+            signatureTracker,
             newMethodTypeResult,
             /* useSpeculativeModeForArgs */ true
         );
@@ -242,10 +280,9 @@ function validateNewAndInitMethods(
         // (cls, *args, **kwargs) -> Self, allow the __init__ method to
         // determine the specialized type of the class.
         newMethodReturnType = ClassType.cloneAsInstance(type);
-    } else if (!isNever(newMethodReturnType) && !isClassInstance(newMethodReturnType)) {
-        // If the __new__ method returns something other than an object or
-        // NoReturn, we'll ignore its return type and assume that it
-        // returns Self.
+    } else if (isAnyOrUnknown(newMethodReturnType)) {
+        // If the __new__ method returns Any or Unknown, we'll ignore its return
+        // type and assume that it returns Self.
         newMethodReturnType = applySolvedTypeVars(
             ClassType.cloneAsInstance(type),
             new TypeVarContext(getTypeVarScopeId(type)),
@@ -255,29 +292,38 @@ function validateNewAndInitMethods(
 
     let initMethodTypeResult: TypeResult | undefined;
 
-    // Validate __init__ if it's present. Skip if the __new__ method produced errors.
+    // If there were errors evaluating the __new__ method, assume that __new__
+    // returns the class instance and proceed accordingly. This may produce
+    // false positives in some cases, but it will prevent false negatives
+    // if the __init__ method also produces type errors (perhaps unrelated
+    // to the errors in the __new__ method).
+    if (argumentErrors) {
+        initMethodTypeResult = { type: convertToInstance(type) };
+    }
+
+    // Validate __init__ if it's present.
     if (
-        !argumentErrors &&
         !isNever(newMethodReturnType) &&
-        !shouldSkipInitEvaluation(evaluator, type, newMethodReturnType)
+        !shouldSkipInitEvaluation(evaluator, type, newMethodReturnType) &&
+        isClassInstance(newMethodReturnType)
     ) {
         // If the __new__ method returned the same type as the class it's constructing
         // but didn't supply solved type arguments, we'll ignore its specialized return
         // type and rely on the __init__ method to supply the type arguments instead.
         let initMethodBindToType = newMethodReturnType;
-        if (isPartlyUnknown(initMethodBindToType)) {
+        if (
+            initMethodBindToType.typeArguments &&
+            initMethodBindToType.typeArguments.some((typeArg) => isUnknown(typeArg))
+        ) {
             initMethodBindToType = ClassType.cloneAsInstance(type);
         }
 
         // Determine whether the class overrides the object.__init__ method.
-        initMethodTypeResult = evaluator.getTypeOfObjectMember(
-            errorNode,
-            initMethodBindToType,
-            '__init__',
-            { method: 'get' },
-            /* diag */ undefined,
-            MemberAccessFlags.SkipObjectBaseClass | MemberAccessFlags.SkipAttributeAccessOverride
-        );
+        const initMethodDiag = new DiagnosticAddendum();
+        initMethodTypeResult = getBoundInitMethod(evaluator, errorNode, initMethodBindToType, initMethodDiag);
+        if (initMethodTypeResult?.typeErrors) {
+            evaluator.addDiagnostic(DiagnosticRule.reportGeneralTypeIssues, initMethodDiag.getString(), errorNode);
+        }
 
         // Validate __init__ if it's present.
         if (initMethodTypeResult) {
@@ -288,6 +334,7 @@ function validateNewAndInitMethods(
                 initMethodBindToType,
                 skipUnknownArgCheck,
                 inferenceContext,
+                signatureTracker,
                 initMethodTypeResult.type
             );
 
@@ -318,6 +365,7 @@ function validateNewAndInitMethods(
                 type,
                 skipUnknownArgCheck,
                 inferenceContext,
+                signatureTracker,
                 newMethodTypeResult,
                 /* useSpeculativeModeForArgs */ false
             );
@@ -356,8 +404,9 @@ function validateNewMethod(
     errorNode: ExpressionNode,
     argList: FunctionArgument[],
     type: ClassType,
-    skipUnknownArgCheck: boolean,
+    skipUnknownArgCheck: boolean | undefined,
     inferenceContext: InferenceContext | undefined,
+    signatureTracker: UniqueSignatureTracker | undefined,
     newMethodTypeResult: TypeResult,
     useSpeculativeModeForArgs: boolean
 ): CallResult {
@@ -365,6 +414,14 @@ function validateNewMethod(
     let isTypeIncomplete = false;
     let argumentErrors = false;
     const overloadsUsedForCall: FunctionType[] = [];
+
+    if (signatureTracker) {
+        newMethodTypeResult.type = ensureFunctionSignaturesAreUnique(
+            newMethodTypeResult.type,
+            signatureTracker,
+            errorNode.start
+        );
+    }
 
     const typeVarContext = new TypeVarContext(getTypeVarScopeId(type));
     typeVarContext.addSolveForScope(getTypeVarScopeId(newMethodTypeResult.type));
@@ -379,7 +436,8 @@ function validateNewMethod(
             newMethodTypeResult,
             typeVarContext,
             skipUnknownArgCheck,
-            inferenceContext
+            inferenceContext,
+            signatureTracker
         );
     });
 
@@ -392,7 +450,15 @@ function validateNewMethod(
 
         // Evaluate the arguments in a non-speculative manner to generate any diagnostics.
         typeVarContext.unlock();
-        evaluator.validateCallArguments(errorNode, argList, newMethodTypeResult, typeVarContext, skipUnknownArgCheck);
+        evaluator.validateCallArguments(
+            errorNode,
+            argList,
+            newMethodTypeResult,
+            typeVarContext,
+            skipUnknownArgCheck,
+            inferenceContext,
+            signatureTracker
+        );
     } else {
         newReturnType = callResult.returnType;
 
@@ -425,8 +491,9 @@ function validateInitMethod(
     errorNode: ExpressionNode,
     argList: FunctionArgument[],
     type: ClassType,
-    skipUnknownArgCheck: boolean,
+    skipUnknownArgCheck: boolean | undefined,
     inferenceContext: InferenceContext | undefined,
+    signatureTracker: UniqueSignatureTracker | undefined,
     initMethodType: Type
 ): CallResult {
     let returnType: Type | undefined;
@@ -434,81 +501,104 @@ function validateInitMethod(
     let argumentErrors = false;
     const overloadsUsedForCall: FunctionType[] = [];
 
+    if (signatureTracker) {
+        initMethodType = ensureFunctionSignaturesAreUnique(initMethodType, signatureTracker, errorNode.start);
+    }
+
     // If there is an expected type, analyze the __init__ call for each of the
     // subtypes that comprise the expected type. If one or more analyzes with no
     // errors, use those results. This requires special-case processing because
     // the __init__ method doesn't return the expected type. It always
     // returns None.
     if (inferenceContext) {
-        returnType = mapSubtypes(inferenceContext.expectedType, (expectedSubType) => {
-            expectedSubType = transformPossibleRecursiveTypeAlias(expectedSubType);
+        let foundWorkingExpectedType = false;
 
-            // If the expected type is the same type as the class and the class
-            // is already explicitly specialized, don't override the explicit
-            // specialization.
-            if (
-                isClassInstance(expectedSubType) &&
-                ClassType.isSameGenericClass(type, expectedSubType) &&
-                type.typeArguments
-            ) {
-                return undefined;
-            }
-
-            const typeVarContext = new TypeVarContext(getTypeVarScopeId(type));
-            typeVarContext.addSolveForScope(getTypeVarScopeId(initMethodType));
-
-            if (
-                populateTypeVarContextBasedOnExpectedType(
-                    evaluator,
-                    ClassType.cloneAsInstance(type),
-                    expectedSubType,
-                    typeVarContext,
-                    getTypeVarScopesForNode(errorNode),
-                    errorNode.start
-                )
-            ) {
-                const specializedConstructor = applySolvedTypeVars(initMethodType, typeVarContext);
-
-                let callResult: CallResult | undefined;
-                callResult = evaluator.useSpeculativeMode(errorNode, () => {
-                    return evaluator.validateCallArguments(
-                        errorNode,
-                        argList,
-                        { type: specializedConstructor },
-                        typeVarContext.clone(),
-                        skipUnknownArgCheck
-                    );
-                });
-
-                if (!callResult.argumentErrors) {
-                    // Call validateCallArguments again, this time without speculative
-                    // mode, so any errors are reported.
-                    callResult = evaluator.validateCallArguments(
-                        errorNode,
-                        argList,
-                        { type: specializedConstructor },
-                        typeVarContext,
-                        skipUnknownArgCheck
-                    );
-
-                    if (callResult.isTypeIncomplete) {
-                        isTypeIncomplete = true;
-                    }
-
-                    if (callResult.argumentErrors) {
-                        argumentErrors = true;
-                    }
-
-                    if (callResult.overloadsUsedForCall) {
-                        appendArray(overloadsUsedForCall, callResult.overloadsUsedForCall);
-                    }
-
-                    return applyExpectedSubtypeForConstructor(evaluator, type, expectedSubType, typeVarContext);
+        returnType = mapSubtypes(
+            inferenceContext.expectedType,
+            (expectedSubType) => {
+                // If we've already successfully evaluated the __init__ method with
+                // one expected type, ignore the remaining ones.
+                if (foundWorkingExpectedType) {
+                    return undefined;
                 }
-            }
 
-            return undefined;
-        });
+                expectedSubType = transformPossibleRecursiveTypeAlias(expectedSubType);
+
+                // If the expected type is the same type as the class and the class
+                // is already explicitly specialized, don't override the explicit
+                // specialization.
+                if (
+                    isClassInstance(expectedSubType) &&
+                    ClassType.isSameGenericClass(type, expectedSubType) &&
+                    type.typeArguments
+                ) {
+                    return undefined;
+                }
+
+                const typeVarContext = new TypeVarContext(getTypeVarScopeId(type));
+                typeVarContext.addSolveForScope(getTypeVarScopeId(initMethodType));
+
+                if (
+                    populateTypeVarContextBasedOnExpectedType(
+                        evaluator,
+                        ClassType.cloneAsInstance(type),
+                        expectedSubType,
+                        typeVarContext,
+                        getTypeVarScopesForNode(errorNode),
+                        errorNode.start
+                    )
+                ) {
+                    const specializedConstructor = applySolvedTypeVars(initMethodType, typeVarContext);
+
+                    let callResult: CallResult | undefined;
+                    callResult = evaluator.useSpeculativeMode(errorNode, () => {
+                        return evaluator.validateCallArguments(
+                            errorNode,
+                            argList,
+                            { type: specializedConstructor },
+                            typeVarContext.clone(),
+                            skipUnknownArgCheck,
+                            /* inferenceContext */ undefined,
+                            signatureTracker
+                        );
+                    });
+
+                    if (!callResult.argumentErrors) {
+                        // Call validateCallArguments again, this time without speculative
+                        // mode, so any errors are reported.
+                        callResult = evaluator.validateCallArguments(
+                            errorNode,
+                            argList,
+                            { type: specializedConstructor },
+                            typeVarContext,
+                            skipUnknownArgCheck,
+                            /* inferenceContext */ undefined,
+                            signatureTracker
+                        );
+
+                        if (callResult.isTypeIncomplete) {
+                            isTypeIncomplete = true;
+                        }
+
+                        if (callResult.argumentErrors) {
+                            argumentErrors = true;
+                        }
+
+                        if (callResult.overloadsUsedForCall) {
+                            appendArray(overloadsUsedForCall, callResult.overloadsUsedForCall);
+                        }
+
+                        // Note that we've found an expected type that works.
+                        foundWorkingExpectedType = true;
+
+                        return applyExpectedSubtypeForConstructor(evaluator, type, expectedSubType, typeVarContext);
+                    }
+                }
+
+                return undefined;
+            },
+            /* sortSubtypes */ true
+        );
 
         if (isNever(returnType) || argumentErrors) {
             returnType = undefined;
@@ -526,7 +616,9 @@ function validateInitMethod(
             argList,
             { type: initMethodType },
             typeVarContext,
-            skipUnknownArgCheck
+            skipUnknownArgCheck,
+            /* inferenceContext */ undefined,
+            signatureTracker
         );
 
         let adjustedClassType = type;
@@ -570,11 +662,9 @@ function validateFallbackConstructorCall(
 
     // It's OK if the argument list consists only of `*args` and `**kwargs`.
     if (argList.length > 0 && argList.some((arg) => arg.argumentCategory === ArgumentCategory.Simple)) {
-        const fileInfo = getFileInfo(errorNode);
         evaluator.addDiagnostic(
-            fileInfo.diagnosticRuleSet.reportGeneralTypeIssues,
-            DiagnosticRule.reportGeneralTypeIssues,
-            Localizer.Diagnostic.constructorNoArgs().format({ type: type.aliasName || type.details.name }),
+            DiagnosticRule.reportCallIssue,
+            LocMessage.constructorNoArgs().format({ type: type.aliasName || type.details.name }),
             errorNode
         );
         reportedErrors = true;
@@ -595,14 +685,34 @@ function validateFallbackConstructorCall(
     const typeVarContext = new TypeVarContext(getTypeVarScopeId(type));
 
     if (inferenceContext) {
-        populateTypeVarContextBasedOnExpectedType(
-            evaluator,
-            ClassType.cloneAsInstance(type),
-            inferenceContext.expectedType,
-            typeVarContext,
-            getTypeVarScopesForNode(errorNode),
-            errorNode.start
-        );
+        let expectedType: Type | undefined = inferenceContext.expectedType;
+
+        // If the expectedType is a union, try to pick one that is likely to
+        // be the best choice.
+        if (isUnion(expectedType)) {
+            expectedType = findSubtype(expectedType, (subtype) => {
+                if (isAnyOrUnknown(subtype) || isNever(subtype)) {
+                    return false;
+                }
+
+                if (isClass(subtype) && evaluator.assignType(subtype, ClassType.cloneAsInstance(type))) {
+                    return true;
+                }
+
+                return false;
+            });
+        }
+
+        if (expectedType) {
+            populateTypeVarContextBasedOnExpectedType(
+                evaluator,
+                ClassType.cloneAsInstance(type),
+                expectedType,
+                typeVarContext,
+                getTypeVarScopesForNode(errorNode),
+                errorNode.start
+            );
+        }
     }
 
     return {
@@ -617,53 +727,38 @@ function validateMetaclassCall(
     errorNode: ExpressionNode,
     argList: FunctionArgument[],
     type: ClassType,
-    skipUnknownArgCheck: boolean,
-    inferenceContext: InferenceContext | undefined
+    skipUnknownArgCheck: boolean | undefined,
+    inferenceContext: InferenceContext | undefined,
+    signatureTracker: UniqueSignatureTracker | undefined
 ): CallResult | undefined {
-    const metaclass = type.details.effectiveMetaclass;
+    const metaclassCallMethodInfo = getBoundCallMethod(evaluator, errorNode, type);
 
-    if (metaclass && isInstantiableClass(metaclass) && !ClassType.isSameGenericClass(metaclass, type)) {
-        const metaclassCallMethodInfo = evaluator.getTypeOfClassMemberName(
-            errorNode,
-            metaclass,
-            /* isAccessedThroughObject */ true,
-            '__call__',
-            { method: 'get' },
-            /* diag */ undefined,
-            MemberAccessFlags.ConsiderMetaclassOnly |
-                MemberAccessFlags.SkipTypeBaseClass |
-                MemberAccessFlags.SkipAttributeAccessOverride,
-            type
-        );
-
-        if (metaclassCallMethodInfo) {
-            const callResult = evaluator.validateCallArguments(
-                errorNode,
-                argList,
-                metaclassCallMethodInfo,
-                /* typeVarContext */ undefined,
-                skipUnknownArgCheck,
-                inferenceContext
-            );
-
-            if (!callResult.returnType || isUnknown(callResult.returnType)) {
-                // The return result isn't known. We'll assume in this case that
-                // the metaclass __call__ method allocated a new instance of the
-                // requested class.
-                const typeVarContext = new TypeVarContext(getTypeVarScopeId(type));
-                callResult.returnType = applyExpectedTypeForConstructor(
-                    evaluator,
-                    type,
-                    inferenceContext,
-                    typeVarContext
-                );
-            }
-
-            return callResult;
-        }
+    if (!metaclassCallMethodInfo) {
+        return undefined;
     }
 
-    return undefined;
+    const callResult = evaluator.validateCallArguments(
+        errorNode,
+        argList,
+        metaclassCallMethodInfo,
+        /* typeVarContext */ undefined,
+        skipUnknownArgCheck,
+        inferenceContext,
+        signatureTracker
+    );
+
+    // If the return type is unannotated, don't use the inferred return type.
+    const callType = metaclassCallMethodInfo.type;
+    if (isFunction(callType) && !callType.details.declaredReturnType) {
+        return undefined;
+    }
+
+    // If the return type is unknown, ignore it.
+    if (callResult.returnType && isUnknown(callResult.returnType)) {
+        return undefined;
+    }
+
+    return callResult;
 }
 
 function applyExpectedSubtypeForConstructor(
@@ -701,7 +796,7 @@ function applyExpectedTypeForConstructor(
     // If this isn't a generic type or it's a type that has already been
     // explicitly specialized, the expected type isn't applicable.
     if (type.details.typeParameters.length === 0 || type.typeArguments) {
-        return ClassType.cloneAsInstance(type);
+        return applySolvedTypeVars(ClassType.cloneAsInstance(type), typeVarContext, { applyInScopePlaceholders: true });
     }
 
     if (inferenceContext) {
@@ -749,137 +844,315 @@ function applyExpectedTypeForTupleConstructor(type: ClassType, inferenceContext:
 export function createFunctionFromConstructor(
     evaluator: TypeEvaluator,
     classType: ClassType,
+    selfType: ClassType | TypeVarType | undefined = undefined,
     recursionCount = 0
-): FunctionType | OverloadedFunctionType | undefined {
-    // Use the __init__ method if available. It's usually more detailed.
-    const initInfo = lookUpClassMember(
-        classType,
-        '__init__',
-        ClassMemberLookupFlags.SkipInstanceVariables | ClassMemberLookupFlags.SkipObjectBaseClass
-    );
+): Type | undefined {
+    const fromMetaclassCall = createFunctionFromMetaclassCall(evaluator, classType, recursionCount);
+    if (fromMetaclassCall) {
+        return fromMetaclassCall;
+    }
 
-    if (initInfo) {
-        const initType = evaluator.getTypeOfMember(initInfo);
-        const objectType = ClassType.cloneAsInstance(classType);
+    const fromNew = createFunctionFromNewMethod(evaluator, classType, selfType, recursionCount);
 
-        function convertInitToConstructor(initSubtype: FunctionType) {
-            let constructorFunction = evaluator.bindFunctionToClassOrObject(
-                objectType,
-                initSubtype,
-                /* memberClass */ undefined,
-                /* errorNode */ undefined,
-                recursionCount
-            ) as FunctionType | undefined;
+    if (fromNew) {
+        let skipInitMethod = false;
 
-            if (constructorFunction) {
-                constructorFunction = FunctionType.clone(constructorFunction);
-                constructorFunction.details.declaredReturnType = objectType;
-                constructorFunction.details.typeVarScopeId = initSubtype.details.typeVarScopeId;
-
-                if (constructorFunction.specializedTypes) {
-                    constructorFunction.specializedTypes.returnType = objectType;
-                }
-
-                if (!constructorFunction.details.docString && classType.details.docString) {
-                    constructorFunction.details.docString = classType.details.docString;
-                }
-
-                constructorFunction.details.flags &= ~FunctionTypeFlags.StaticMethod;
-                constructorFunction.details.constructorTypeVarScopeId = getTypeVarScopeId(classType);
+        doForEachSignature(fromNew, (signature) => {
+            const newMethodReturnType = FunctionType.getEffectiveReturnType(signature);
+            if (newMethodReturnType && shouldSkipInitEvaluation(evaluator, classType, newMethodReturnType)) {
+                skipInitMethod = true;
             }
+        });
 
-            return constructorFunction;
-        }
-
-        if (isFunction(initType)) {
-            return convertInitToConstructor(initType);
-        } else if (isOverloadedFunction(initType)) {
-            const initOverloads: FunctionType[] = [];
-            initType.overloads.forEach((overload) => {
-                const converted = convertInitToConstructor(overload);
-                if (converted) {
-                    initOverloads.push(converted);
-                }
-            });
-
-            if (initOverloads.length === 0) {
-                return undefined;
-            } else if (initOverloads.length === 1) {
-                return initOverloads[0];
-            }
-
-            return OverloadedFunctionType.create(initOverloads);
+        if (skipInitMethod) {
+            return fromNew;
         }
     }
 
-    // Fall back on the __new__ method if __init__ isn't available.
+    const fromInit = createFunctionFromInitMethod(evaluator, classType, selfType, recursionCount);
+
+    // If there is both a __new__ and __init__ method, return a union
+    // comprised of both resulting function types.
+    if (fromNew && fromInit) {
+        return combineTypes([fromInit, fromNew]);
+    }
+
+    if (fromNew || fromInit) {
+        return fromNew ?? fromInit;
+    }
+
+    return fromNew ?? createFunctionFromObjectNewMethod(classType);
+}
+
+function createFunctionFromMetaclassCall(
+    evaluator: TypeEvaluator,
+    classType: ClassType,
+    recursionCount: number
+): FunctionType | OverloadedFunctionType | undefined {
+    const metaclass = classType.details.effectiveMetaclass;
+    if (!metaclass || !isClass(metaclass)) {
+        return undefined;
+    }
+
+    const callInfo = lookUpClassMember(
+        metaclass,
+        '__call__',
+        MemberAccessFlags.SkipInstanceMembers |
+            MemberAccessFlags.SkipTypeBaseClass |
+            MemberAccessFlags.SkipAttributeAccessOverride
+    );
+
+    if (!callInfo) {
+        return undefined;
+    }
+
+    const callType = evaluator.getTypeOfMember(callInfo);
+    if (!isFunction(callType) && !isOverloadedFunction(callType)) {
+        return undefined;
+    }
+
+    const boundCallType = evaluator.bindFunctionToClassOrObject(
+        classType,
+        callType,
+        callInfo && isInstantiableClass(callInfo.classType) ? callInfo.classType : undefined,
+        /* treatConstructorAsClassMethod */ false,
+        ClassType.cloneAsInstantiable(classType),
+        /* diag */ undefined,
+        recursionCount
+    );
+
+    if (!boundCallType) {
+        return undefined;
+    }
+
+    let useMetaclassCall = false;
+
+    // Look at the signatures of all the __call__ methods to determine whether
+    // any of them returns something other than the instance of the class being
+    // constructed.
+    doForEachSignature(boundCallType, (signature) => {
+        if (signature.details.declaredReturnType) {
+            const returnType = FunctionType.getEffectiveReturnType(signature);
+            if (returnType && shouldSkipNewAndInitEvaluation(evaluator, classType, returnType)) {
+                useMetaclassCall = true;
+            }
+        }
+    });
+
+    return useMetaclassCall ? boundCallType : undefined;
+}
+
+function createFunctionFromNewMethod(
+    evaluator: TypeEvaluator,
+    classType: ClassType,
+    selfType: ClassType | TypeVarType | undefined,
+    recursionCount: number
+): FunctionType | OverloadedFunctionType | undefined {
     const newInfo = lookUpClassMember(
         classType,
         '__new__',
-        ClassMemberLookupFlags.SkipInstanceVariables | ClassMemberLookupFlags.SkipObjectBaseClass
+        MemberAccessFlags.SkipInstanceMembers |
+            MemberAccessFlags.SkipAttributeAccessOverride |
+            MemberAccessFlags.SkipObjectBaseClass
     );
 
-    if (newInfo) {
-        const newType = evaluator.getTypeOfMember(newInfo);
-
-        const convertNewToConstructor = (newSubtype: FunctionType) => {
-            let constructorFunction = evaluator.bindFunctionToClassOrObject(
-                classType,
-                newSubtype,
-                /* memberClass */ undefined,
-                /* errorNode */ undefined,
-                recursionCount,
-                /* treatConstructorAsClassMember */ true
-            ) as FunctionType | undefined;
-
-            if (constructorFunction) {
-                constructorFunction = FunctionType.clone(constructorFunction);
-                constructorFunction.details.typeVarScopeId = newSubtype.details.typeVarScopeId;
-
-                if (!constructorFunction.details.docString && classType.details.docString) {
-                    constructorFunction.details.docString = classType.details.docString;
-                }
-
-                constructorFunction.details.flags &= ~(
-                    FunctionTypeFlags.StaticMethod | FunctionTypeFlags.ConstructorMethod
-                );
-                constructorFunction.details.constructorTypeVarScopeId = getTypeVarScopeId(classType);
-            }
-
-            return constructorFunction;
-        };
-
-        if (isFunction(newType)) {
-            return convertNewToConstructor(newType);
-        } else if (isOverloadedFunction(newType)) {
-            const newOverloads: FunctionType[] = [];
-            newType.overloads.forEach((overload) => {
-                const converted = convertNewToConstructor(overload);
-                if (converted) {
-                    newOverloads.push(converted);
-                }
-            });
-
-            if (newOverloads.length === 0) {
-                return undefined;
-            } else if (newOverloads.length === 1) {
-                return newOverloads[0];
-            }
-
-            return OverloadedFunctionType.create(newOverloads);
-        }
+    if (!newInfo) {
+        return undefined;
     }
 
-    // Return a generic constructor.
+    const newType = evaluator.getTypeOfMember(newInfo);
+
+    const convertNewToConstructor = (newSubtype: FunctionType) => {
+        // If there are no parameters that include class-scoped type parameters,
+        // self-specialize the class because the type arguments for the class
+        // can't be solved if there are no parameters to supply them.
+        const hasParametersWithTypeVars = newSubtype.details.parameters.some((param, index) => {
+            if (index === 0 || !param.name) {
+                return false;
+            }
+
+            const paramType = FunctionType.getEffectiveParameterType(newSubtype, index);
+            const typeVars = getTypeVarArgumentsRecursive(paramType);
+            return typeVars.some((typeVar) => typeVar.scopeId === getTypeVarScopeId(classType));
+        });
+
+        const boundNew = evaluator.bindFunctionToClassOrObject(
+            hasParametersWithTypeVars ? selfSpecializeClass(classType) : classType,
+            newSubtype,
+            newInfo && isInstantiableClass(newInfo.classType) ? newInfo.classType : undefined,
+            /* treatConstructorAsClassMethod */ true,
+            selfType,
+            /* diag */ undefined,
+            recursionCount
+        ) as FunctionType | undefined;
+
+        if (!boundNew) {
+            return undefined;
+        }
+
+        const convertedNew = FunctionType.clone(boundNew);
+        convertedNew.details.typeVarScopeId = newSubtype.details.typeVarScopeId;
+
+        if (!convertedNew.details.docString && classType.details.docString) {
+            convertedNew.details.docString = classType.details.docString;
+        }
+
+        convertedNew.details.flags &= ~(FunctionTypeFlags.StaticMethod | FunctionTypeFlags.ConstructorMethod);
+        convertedNew.details.constructorTypeVarScopeId = getTypeVarScopeId(classType);
+
+        return convertedNew;
+    };
+
+    if (isFunction(newType)) {
+        return convertNewToConstructor(newType);
+    }
+
+    if (!isOverloadedFunction(newType)) {
+        return undefined;
+    }
+
+    const newOverloads: FunctionType[] = [];
+    newType.overloads.forEach((overload) => {
+        const converted = convertNewToConstructor(overload);
+        if (converted) {
+            newOverloads.push(converted);
+        }
+    });
+
+    if (newOverloads.length === 0) {
+        return undefined;
+    }
+
+    if (newOverloads.length === 1) {
+        return newOverloads[0];
+    }
+
+    return OverloadedFunctionType.create(newOverloads);
+}
+
+function createFunctionFromObjectNewMethod(classType: ClassType) {
+    // Return a fallback constructor based on the object.__new__ method.
     const constructorFunction = FunctionType.createSynthesizedInstance('__new__', FunctionTypeFlags.None);
     constructorFunction.details.declaredReturnType = ClassType.cloneAsInstance(classType);
-    FunctionType.addDefaultParameters(constructorFunction);
+
+    // If this is type[T] or a protocol, we don't know what parameters are accepted
+    // by the constructor, so add the default parameters.
+    if (classType.includeSubclasses || ClassType.isProtocolClass(classType)) {
+        FunctionType.addDefaultParameters(constructorFunction);
+    }
 
     if (!constructorFunction.details.docString && classType.details.docString) {
         constructorFunction.details.docString = classType.details.docString;
     }
 
     return constructorFunction;
+}
+
+function createFunctionFromInitMethod(
+    evaluator: TypeEvaluator,
+    classType: ClassType,
+    selfType: ClassType | TypeVarType | undefined,
+    recursionCount: number
+): FunctionType | OverloadedFunctionType | undefined {
+    // Use the __init__ method if available. It's usually more detailed.
+    const initInfo = lookUpClassMember(
+        classType,
+        '__init__',
+        MemberAccessFlags.SkipInstanceMembers |
+            MemberAccessFlags.SkipAttributeAccessOverride |
+            MemberAccessFlags.SkipObjectBaseClass
+    );
+
+    if (!initInfo) {
+        return undefined;
+    }
+
+    const initType = evaluator.getTypeOfMember(initInfo);
+    const objectType = ClassType.cloneAsInstance(classType);
+
+    function convertInitToConstructor(initSubtype: FunctionType) {
+        const boundInit = evaluator.bindFunctionToClassOrObject(
+            objectType,
+            initSubtype,
+            initInfo && isInstantiableClass(initInfo.classType) ? initInfo.classType : undefined,
+            /* treatConstructorAsClassMethod */ undefined,
+            selfType,
+            /* diag */ undefined,
+            recursionCount
+        ) as FunctionType | undefined;
+
+        if (!boundInit) {
+            return undefined;
+        }
+
+        const convertedInit = FunctionType.clone(boundInit);
+        convertedInit.details.declaredReturnType = boundInit.strippedFirstParamType ?? selfType ?? objectType;
+        convertedInit.details.name = '';
+        convertedInit.details.fullName = '';
+
+        if (convertedInit.specializedTypes) {
+            convertedInit.specializedTypes.returnType = selfType ?? objectType;
+        }
+
+        if (!convertedInit.details.docString && classType.details.docString) {
+            convertedInit.details.docString = classType.details.docString;
+        }
+
+        convertedInit.details.flags &= ~FunctionTypeFlags.StaticMethod;
+        convertedInit.details.constructorTypeVarScopeId = getTypeVarScopeId(classType);
+
+        return convertedInit;
+    }
+
+    if (isFunction(initType)) {
+        return convertInitToConstructor(initType);
+    }
+
+    if (!isOverloadedFunction(initType)) {
+        return undefined;
+    }
+
+    const initOverloads: FunctionType[] = [];
+    initType.overloads.forEach((overload) => {
+        const converted = convertInitToConstructor(overload);
+        if (converted) {
+            initOverloads.push(converted);
+        }
+    });
+
+    if (initOverloads.length === 0) {
+        return undefined;
+    }
+
+    if (initOverloads.length === 1) {
+        return initOverloads[0];
+    }
+
+    return OverloadedFunctionType.create(initOverloads);
+}
+
+// If the __call__ method returns a type that is not an instance of the class,
+// skip the __new__ and __init__ method evaluation.
+function shouldSkipNewAndInitEvaluation(
+    evaluator: TypeEvaluator,
+    classType: ClassType,
+    callMethodReturnType: Type
+): boolean {
+    if (
+        !evaluator.assignType(convertToInstance(classType), callMethodReturnType) ||
+        isNever(callMethodReturnType) ||
+        findSubtype(callMethodReturnType, (subtype) => isAny(subtype))
+    ) {
+        return true;
+    }
+
+    // Handle the special case of an enum class, where the __new__ and __init__
+    // methods are replaced at runtime by the metaclass.
+    if (ClassType.isEnumClass(classType)) {
+        return true;
+    }
+
+    return false;
 }
 
 // If __new__ returns a type that is not an instance of the class, skip the
@@ -890,7 +1163,7 @@ function shouldSkipInitEvaluation(evaluator: TypeEvaluator, classType: ClassType
 
     let skipInitCheck = false;
     doForEachSubtype(returnType, (subtype) => {
-        if (isAnyOrUnknown(subtype)) {
+        if (isUnknown(subtype)) {
             return;
         }
 
@@ -915,10 +1188,6 @@ function shouldSkipInitEvaluation(evaluator: TypeEvaluator, classType: ClassType
 // of "def __new__(cls, *args, **kwargs) -> Self".
 function isDefaultNewMethod(newMethod?: Type): boolean {
     if (!newMethod || !isFunction(newMethod)) {
-        return false;
-    }
-
-    if (newMethod.details.paramSpec) {
         return false;
     }
 

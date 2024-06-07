@@ -37,32 +37,32 @@ export const enum ParseNodeType {
     Call,
 
     Class, // 10
+    Comprehension,
+    ComprehensionFor,
+    ComprehensionIf,
     Constant,
     Continue,
     Decorator,
     Del,
     Dictionary,
     DictionaryExpandEntry,
-    DictionaryKeyEntry,
+
+    DictionaryKeyEntry, // 20
     Ellipsis,
     If,
-
-    Import, // 20
+    Import,
     ImportAs,
     ImportFrom,
     ImportFromAs,
     Index,
     Except,
     For,
-    FormatString,
+
+    FormatString, // 30
     Function,
     Global,
-
-    Lambda, // 30
+    Lambda,
     List,
-    ListComprehension,
-    ListComprehensionFor,
-    ListComprehensionIf,
     MemberAccess,
     Module,
     ModuleName,
@@ -310,22 +310,22 @@ export namespace ForNode {
     }
 }
 
-export type ListComprehensionForIfNode = ListComprehensionForNode | ListComprehensionIfNode;
+export type ComprehensionForIfNode = ComprehensionForNode | ComprehensionIfNode;
 
-export interface ListComprehensionForNode extends ParseNodeBase {
-    readonly nodeType: ParseNodeType.ListComprehensionFor;
+export interface ComprehensionForNode extends ParseNodeBase {
+    readonly nodeType: ParseNodeType.ComprehensionFor;
     isAsync?: boolean;
     asyncToken?: Token;
     targetExpression: ExpressionNode;
     iterableExpression: ExpressionNode;
 }
 
-export namespace ListComprehensionForNode {
+export namespace ComprehensionForNode {
     export function create(startToken: Token, targetExpression: ExpressionNode, iterableExpression: ExpressionNode) {
-        const node: ListComprehensionForNode = {
+        const node: ComprehensionForNode = {
             start: startToken.start,
             length: startToken.length,
-            nodeType: ParseNodeType.ListComprehensionFor,
+            nodeType: ParseNodeType.ComprehensionFor,
             id: _nextNodeId++,
             targetExpression,
             iterableExpression,
@@ -341,17 +341,17 @@ export namespace ListComprehensionForNode {
     }
 }
 
-export interface ListComprehensionIfNode extends ParseNodeBase {
-    readonly nodeType: ParseNodeType.ListComprehensionIf;
+export interface ComprehensionIfNode extends ParseNodeBase {
+    readonly nodeType: ParseNodeType.ComprehensionIf;
     testExpression: ExpressionNode;
 }
 
-export namespace ListComprehensionIfNode {
+export namespace ComprehensionIfNode {
     export function create(ifToken: Token, testExpression: ExpressionNode) {
-        const node: ListComprehensionIfNode = {
+        const node: ComprehensionIfNode = {
             start: ifToken.start,
             length: ifToken.length,
-            nodeType: ParseNodeType.ListComprehensionIf,
+            nodeType: ParseNodeType.ComprehensionIf,
             id: _nextNodeId++,
             testExpression,
         };
@@ -699,7 +699,7 @@ export type ExpressionNode =
     | UnpackNode
     | TupleNode
     | CallNode
-    | ListComprehensionNode
+    | ComprehensionNode
     | IndexNode
     | SliceNode
     | YieldNode
@@ -729,7 +729,7 @@ export function isExpressionNode(node: ParseNode): node is ExpressionNode {
         case ParseNodeType.Unpack:
         case ParseNodeType.Tuple:
         case ParseNodeType.Call:
-        case ParseNodeType.ListComprehension:
+        case ParseNodeType.Comprehension:
         case ParseNodeType.Index:
         case ParseNodeType.Slice:
         case ParseNodeType.Yield:
@@ -1189,11 +1189,13 @@ export namespace TernaryNode {
 export interface UnpackNode extends ParseNodeBase {
     readonly nodeType: ParseNodeType.Unpack;
     expression: ExpressionNode;
+    starToken: Token;
 }
 
 export namespace UnpackNode {
     export function create(starToken: Token, expression: ExpressionNode) {
         const node: UnpackNode = {
+            starToken,
             start: starToken.start,
             length: starToken.length,
             nodeType: ParseNodeType.Unpack,
@@ -1264,20 +1266,20 @@ export namespace CallNode {
     }
 }
 
-export interface ListComprehensionNode extends ParseNodeBase {
-    readonly nodeType: ParseNodeType.ListComprehension;
+export interface ComprehensionNode extends ParseNodeBase {
+    readonly nodeType: ParseNodeType.Comprehension;
     expression: ParseNode;
-    forIfNodes: ListComprehensionForIfNode[];
+    forIfNodes: ComprehensionForIfNode[];
     isGenerator: boolean;
     isParenthesized?: boolean;
 }
 
-export namespace ListComprehensionNode {
+export namespace ComprehensionNode {
     export function create(expression: ParseNode, isGenerator: boolean) {
-        const node: ListComprehensionNode = {
+        const node: ComprehensionNode = {
             start: expression.start,
             length: expression.length,
-            nodeType: ParseNodeType.ListComprehension,
+            nodeType: ParseNodeType.Comprehension,
             id: _nextNodeId++,
             expression,
             forIfNodes: [],
@@ -1700,7 +1702,7 @@ export namespace DictionaryExpandEntryNode {
     }
 }
 
-export type DictionaryEntryNode = DictionaryKeyEntryNode | DictionaryExpandEntryNode | ListComprehensionNode;
+export type DictionaryEntryNode = DictionaryKeyEntryNode | DictionaryExpandEntryNode | ComprehensionNode;
 
 export interface SetNode extends ParseNodeBase {
     readonly nodeType: ParseNodeType.Set;
@@ -2432,6 +2434,9 @@ export type ParseNode =
     | CallNode
     | CaseNode
     | ClassNode
+    | ComprehensionNode
+    | ComprehensionForNode
+    | ComprehensionIfNode
     | ConstantNode
     | ContinueNode
     | DecoratorNode
@@ -2454,9 +2459,6 @@ export type ParseNode =
     | GlobalNode
     | LambdaNode
     | ListNode
-    | ListComprehensionNode
-    | ListComprehensionForNode
-    | ListComprehensionIfNode
     | MatchNode
     | MemberAccessNode
     | ModuleNameNode
@@ -2499,6 +2501,12 @@ export type ParseNode =
     | YieldNode
     | YieldFromNode;
 
-export type EvaluationScopeNode = LambdaNode | FunctionNode | ModuleNode | ClassNode | ListComprehensionNode;
-export type ExecutionScopeNode = LambdaNode | FunctionNode | ModuleNode;
+export type EvaluationScopeNode =
+    | LambdaNode
+    | FunctionNode
+    | ModuleNode
+    | ClassNode
+    | ComprehensionNode
+    | TypeParameterListNode;
+export type ExecutionScopeNode = LambdaNode | FunctionNode | ModuleNode | TypeParameterListNode;
 export type TypeParameterScopeNode = FunctionNode | ClassNode | TypeAliasNode;

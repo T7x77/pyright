@@ -8,8 +8,9 @@
 
 import assert from 'assert';
 
-import { combinePaths, comparePathsCaseSensitive, getFileName, normalizeSlashes } from '../common/pathUtils';
+import { combinePaths, getFileName, normalizeSlashes } from '../common/pathUtils';
 import { compareStringsCaseSensitive } from '../common/stringUtils';
+import { Uri } from '../common/uri/uri';
 import { Range } from './harness/fourslash/fourSlashTypes';
 import { runFourSlashTestContent } from './harness/fourslash/runner';
 import { parseAndGetTestState } from './harness/fourslash/testState';
@@ -44,7 +45,11 @@ test('Multiple files', () => {
     const state = parseAndGetTestState(code, factory.srcFolder).state;
 
     assert.equal(state.cwd(), normalizeSlashes('/'));
-    assert(state.fs.existsSync(normalizeSlashes(combinePaths(factory.srcFolder, 'file1.py'))));
+    assert(
+        state.fs.existsSync(
+            Uri.file(normalizeSlashes(combinePaths(factory.srcFolder, 'file1.py')), state.serviceProvider)
+        )
+    );
 });
 
 test('Configuration', () => {
@@ -114,11 +119,15 @@ test('Configuration', () => {
     const state = parseAndGetTestState(code, factory.srcFolder).state;
 
     assert.equal(state.cwd(), normalizeSlashes('/'));
-    assert(state.fs.existsSync(normalizeSlashes(combinePaths(factory.srcFolder, 'file1.py'))));
+    assert(
+        state.fs.existsSync(
+            Uri.file(normalizeSlashes(combinePaths(factory.srcFolder, 'file1.py')), state.serviceProvider)
+        )
+    );
 
     assert.equal(state.configOptions.diagnosticRuleSet.reportMissingImports, 'error');
     assert.equal(state.configOptions.diagnosticRuleSet.reportMissingModuleSource, 'warning');
-    assert.equal(state.configOptions.stubPath, normalizeSlashes('/src/typestubs'));
+    assert.equal(state.configOptions.stubPath?.getFilePath(), normalizeSlashes('/src/typestubs'));
 });
 
 test('stubPath configuration', () => {
@@ -130,7 +139,7 @@ test('stubPath configuration', () => {
     `;
 
     const state = parseAndGetTestState(code).state;
-    assert.equal(state.configOptions.stubPath, normalizeSlashes('/src/typestubs'));
+    assert.equal(state.configOptions.stubPath?.getFilePath(), normalizeSlashes('/src/typestubs'));
 });
 
 test('Duplicated stubPath configuration', () => {
@@ -143,7 +152,7 @@ test('Duplicated stubPath configuration', () => {
     `;
 
     const state = parseAndGetTestState(code).state;
-    assert.equal(state.configOptions.stubPath, normalizeSlashes('/src/typestubs2'));
+    assert.equal(state.configOptions.stubPath?.getFilePath(), normalizeSlashes('/src/typestubs2'));
 });
 
 test('ProjectRoot', () => {
@@ -159,9 +168,9 @@ test('ProjectRoot', () => {
     const state = parseAndGetTestState(code).state;
 
     assert.equal(state.cwd(), normalizeSlashes('/root'));
-    assert(state.fs.existsSync(normalizeSlashes('/root/file1.py')));
+    assert(state.fs.existsSync(Uri.file(normalizeSlashes('/root/file1.py'), state.serviceProvider)));
 
-    assert.equal(state.configOptions.projectRoot, normalizeSlashes('/root'));
+    assert.equal(state.configOptions.projectRoot.getFilePath(), normalizeSlashes('/root'));
 });
 
 test('CustomTypeshedFolder', () => {
@@ -177,7 +186,7 @@ test('CustomTypeshedFolder', () => {
     // mount the folder this file is in as typeshed folder and check whether
     // in typeshed folder in virtual file system, this file exists.
     const state = parseAndGetTestState(code).state;
-    assert(state.fs.existsSync(combinePaths(factory.typeshedFolder, getFileName(__filename))));
+    assert(state.fs.existsSync(factory.typeshedFolder.combinePaths(getFileName(__filename))));
 });
 
 test('IgnoreCase', () => {
@@ -192,7 +201,11 @@ test('IgnoreCase', () => {
 
     const state = parseAndGetTestState(code, factory.srcFolder).state;
 
-    assert(state.fs.existsSync(normalizeSlashes(combinePaths(factory.srcFolder, 'FILE1.py'))));
+    assert(
+        state.fs.existsSync(
+            Uri.file(normalizeSlashes(combinePaths(factory.srcFolder, 'FILE1.py')), state.serviceProvider)
+        )
+    );
 });
 
 test('GoToMarker', () => {
@@ -261,7 +274,7 @@ test('Markers', () => {
             .getMarkers()
             .map((m) => state.getMarkerName(m))
             .sort(compareStringsCaseSensitive),
-        state.getMarkerNames().sort(comparePathsCaseSensitive)
+        state.getMarkerNames().sort(compareStringsCaseSensitive)
     );
 });
 

@@ -11,6 +11,7 @@
 // * NOTE * except tests, this should be only file that import "fs"
 import type * as fs from 'fs';
 import { FileWatcher, FileWatcherEventHandler } from './fileWatcher';
+import { Uri } from './uri/uri';
 
 export interface Stats {
     size: number;
@@ -32,59 +33,70 @@ export interface MkDirOptions {
     // mode: string | number;
 }
 
+export interface ReadOnlyFileSystem {
+    existsSync(uri: Uri): boolean;
+    chdir(uri: Uri): void;
+    readdirEntriesSync(uri: Uri): fs.Dirent[];
+    readdirSync(uri: Uri): string[];
+    readFileSync(uri: Uri, encoding?: null): Buffer;
+    readFileSync(uri: Uri, encoding: BufferEncoding): string;
+    readFileSync(uri: Uri, encoding?: BufferEncoding | null): string | Buffer;
+
+    statSync(uri: Uri): Stats;
+    realpathSync(uri: Uri): Uri;
+    getModulePath(): Uri;
+    // Async I/O
+    readFile(uri: Uri): Promise<Buffer>;
+    readFileText(uri: Uri, encoding?: BufferEncoding): Promise<string>;
+    // Return path in casing on OS.
+    realCasePath(uri: Uri): Uri;
+
+    // See whether the file is mapped to another location.
+    isMappedUri(uri: Uri): boolean;
+
+    // Get original uri if the given uri is mapped.
+    getOriginalUri(mappedUri: Uri): Uri;
+
+    // Get mapped uri if the given uri is mapped.
+    getMappedUri(originalUri: Uri): Uri;
+
+    isInZip(uri: Uri): boolean;
+}
+
+export interface FileSystem extends ReadOnlyFileSystem {
+    mkdirSync(uri: Uri, options?: MkDirOptions): void;
+    writeFileSync(uri: Uri, data: string | Buffer, encoding: BufferEncoding | null): void;
+
+    unlinkSync(uri: Uri): void;
+    rmdirSync(uri: Uri): void;
+
+    createFileSystemWatcher(uris: Uri[], listener: FileWatcherEventHandler): FileWatcher;
+    createReadStream(uri: Uri): fs.ReadStream;
+    createWriteStream(uri: Uri): fs.WriteStream;
+    copyFileSync(uri: Uri, dst: Uri): void;
+}
+
 export interface TmpfileOptions {
     postfix?: string;
     prefix?: string;
 }
 
-export interface ReadOnlyFileSystem {
-    existsSync(path: string): boolean;
-    chdir(path: string): void;
-    readdirEntriesSync(path: string): fs.Dirent[];
-    readdirSync(path: string): string[];
-    readFileSync(path: string, encoding?: null): Buffer;
-    readFileSync(path: string, encoding: BufferEncoding): string;
-    readFileSync(path: string, encoding?: BufferEncoding | null): string | Buffer;
-
-    statSync(path: string): Stats;
-    realpathSync(path: string): string;
-    getModulePath(): string;
-    // Async I/O
-    readFile(path: string): Promise<Buffer>;
-    readFileText(path: string, encoding?: BufferEncoding): Promise<string>;
-    // Return path in casing on OS.
-    realCasePath(path: string): string;
-
-    // See whether the file is mapped to another location.
-    isMappedFilePath(filepath: string): boolean;
-
-    // Get original filepath if the given filepath is mapped.
-    getOriginalFilePath(mappedFilePath: string): string;
-
-    // Get mapped filepath if the given filepath is mapped.
-    getMappedFilePath(originalFilepath: string): string;
-
-    getUri(path: string): string;
-
-    isInZipOrEgg(path: string): boolean;
+export interface TempFile {
+    // The directory returned by tmpdir must exist and be the same each time tmpdir is called.
+    tmpdir(): Uri;
+    tmpfile(options?: TmpfileOptions): Uri;
 }
 
-export interface FileSystem extends ReadOnlyFileSystem {
-    mkdirSync(path: string, options?: MkDirOptions): void;
-    writeFileSync(path: string, data: string | Buffer, encoding: BufferEncoding | null): void;
+export namespace FileSystem {
+    export function is(value: any): value is FileSystem {
+        return value.createFileSystemWatcher && value.createReadStream && value.createWriteStream && value.copyFileSync;
+    }
+}
 
-    unlinkSync(path: string): void;
-    rmdirSync(path: string): void;
-
-    createFileSystemWatcher(paths: string[], listener: FileWatcherEventHandler): FileWatcher;
-    createReadStream(path: string): fs.ReadStream;
-    createWriteStream(path: string): fs.WriteStream;
-    copyFileSync(src: string, dst: string): void;
-
-    // The directory returned by tmpdir must exist and be the same each time tmpdir is called.
-    tmpdir(): string;
-    tmpfile(options?: TmpfileOptions): string;
-    dispose(): void;
+export namespace TempFile {
+    export function is(value: any): value is TempFile {
+        return value.tmpdir && value.tmpfile;
+    }
 }
 
 export class VirtualDirent implements fs.Dirent {

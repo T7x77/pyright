@@ -1,10 +1,11 @@
 # This sample tests the TypeVar matching logic related to
 # variadic type variables.
 
-# pyright: reportMissingModuleSource=false
-
-from typing import Generic, Sequence, TypeVar, Union
-from typing_extensions import TypeVarTuple, Unpack
+from typing import Any, Generic, Literal, TypeVar, overload
+from typing_extensions import (  # pyright: ignore[reportMissingModuleSource]
+    TypeVarTuple,
+    Unpack,
+)
 
 
 _T = TypeVar("_T")
@@ -17,17 +18,13 @@ class Array(Generic[Unpack[_Xs]]):
         reveal_type(args, expected_text="tuple[*_Xs@Array]")
 
     # This should generate an error because _Xs is not unpacked.
-    def foo(self, *args: _Xs) -> None:
-        ...
+    def foo(self, *args: _Xs) -> None: ...
 
 
-def linearize(value: Array[Unpack[_Xs]]) -> Sequence[Union[Unpack[_Xs]]]:
-    reveal_type(value, expected_text="Array[*_Xs@linearize]")
-    return []
+def linearize(value: Array[Unpack[_Xs]]) -> tuple[Unpack[_Xs]]: ...
 
 
-def array_to_tuple(value: Array[Unpack[_Xs]]) -> tuple[complex, Unpack[_Xs]]:
-    ...
+def array_to_tuple(value: Array[Unpack[_Xs]]) -> tuple[complex, Unpack[_Xs]]: ...
 
 
 def func1(x: Array[int, str, str, float], y: Array[()]):
@@ -39,13 +36,13 @@ def func1(x: Array[int, str, str, float], y: Array[()]):
     reveal_type(a1, expected_text="Array[int, float, str]")
 
     a2 = linearize(a1)
-    reveal_type(a2, expected_text="Sequence[int | float | str]")
+    reveal_type(a2, expected_text="tuple[int, float, str]")
 
     b1 = Array()
     reveal_type(b1, expected_text="Array[*tuple[()]]")
 
     b2 = linearize(b1)
-    reveal_type(b2, expected_text="Sequence[Never]")
+    reveal_type(b2, expected_text="tuple[()]")
 
     e = array_to_tuple(x)
     reveal_type(e, expected_text="tuple[complex, int, str, str, float]")
@@ -73,7 +70,7 @@ v4: Array[int, str, int, int] = v1
 v5: Array[int, str] = v1
 
 
-def test1(p1: tuple[str, int], p2: list[str]):
+def func2(p1: tuple[str, int], p2: list[str]):
     v6 = Array(*p1)
     reveal_type(v6, expected_text="Array[str, int]")
 
@@ -83,3 +80,20 @@ def test1(p1: tuple[str, int], p2: list[str]):
     # This should generate an error because open-ended
     # tuple types should not be allowed.
     v8 = Array(*p2)
+
+
+def func3(x: Array[Unpack[_Xs]]) -> Array[Unpack[_Xs]]:
+    y: Array[Unpack[tuple[Any, ...]]] = x
+    return x
+
+
+@overload
+def func4(signal: Array[*_Xs], *args: *_Xs) -> None: ...
+@overload
+def func4(signal: str, *args: Any) -> None: ...
+def func4(signal: Array[*_Xs] | str, *args: *_Xs) -> None: ...
+
+
+def func5(a1: Array[Literal["a", "b"]], a2: Array[Literal["a"], Literal["b"]]):
+    func4(a1, "a")
+    func4(a2, "a", "b")

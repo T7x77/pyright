@@ -20,13 +20,17 @@ import { TypeEvaluator } from '../analyzer/typeEvaluatorTypes';
 import { maxTypeRecursionCount } from '../analyzer/types';
 import { throwIfCancellationRequested } from '../common/cancellationUtils';
 import { appendArray } from '../common/collectionUtils';
+import { isDefined } from '../common/core';
 import { assertNever } from '../common/debug';
-import { ProgramView } from '../common/extensibility';
+import { ProgramView, ReferenceUseCase, SymbolUsageProvider } from '../common/extensibility';
+import { ReadOnlyFileSystem } from '../common/fileSystem';
 import { convertOffsetToPosition, convertPositionToOffset } from '../common/positionUtils';
+import { ServiceKeys } from '../common/serviceKeys';
 import { DocumentRange, Position, TextRange, doesRangeContain } from '../common/textRange';
+import { Uri } from '../common/uri/uri';
 import { NameNode, ParseNode, ParseNodeType } from '../parser/parseNodes';
-import { ParseResults } from '../parser/parser';
-import { DocumentSymbolCollector, DocumentSymbolCollectorUseCase } from './documentSymbolCollector';
+import { ParseFileResults } from '../parser/parser';
+import { CollectionResult, DocumentSymbolCollector } from './documentSymbolCollector';
 import { convertDocumentRangesToLocation } from './navigationUtils';
 
 export type ReferenceCallback = (locations: DocumentRange[]) => void;
@@ -41,7 +45,8 @@ export class ReferencesResult {
         readonly nodeAtOffset: ParseNode,
         readonly symbolNames: string[],
         readonly declarations: Declaration[],
-        readonly useCase: DocumentSymbolCollectorUseCase,
+        readonly useCase: ReferenceUseCase,
+        readonly providers: readonly SymbolUsageProvider[],
         private readonly _reporter?: ReferenceCallback
     ) {
         // Filter out any import decls. but leave one with alias.
@@ -95,19 +100,24 @@ export class ReferencesResult {
 }
 
 export class FindReferencesTreeWalker {
-    private _parseResults: ParseResults | undefined;
+    private _parseResults: ParseFileResults | undefined;
 
     constructor(
         private _program: ProgramView,
-        private _filePath: string,
+        private _fileUri: Uri,
         private _referencesResult: ReferencesResult,
         private _includeDeclaration: boolean,
-        private _cancellationToken: CancellationToken
+        private _cancellationToken: CancellationToken,
+        private readonly _createDocumentRange: (
+            fileUri: Uri,
+            result: CollectionResult,
+            parseResults: ParseFileResults
+        ) => DocumentRange = FindReferencesTreeWalker.createDocumentRange
     ) {
-        this._parseResults = this._program.getParseResults(this._filePath);
+        this._parseResults = this._program.getParseResults(this._fileUri);
     }
 
-    findReferences(rootNode = this._parseResults?.parseTree) {
+    findReferences(rootNode = this._parseResults?.parserOutput.parseTree) {
         const results: DocumentRange[] = [];
         if (!this._parseResults) {
             return results;
@@ -117,66 +127,86 @@ export class FindReferencesTreeWalker {
             this._program,
             this._referencesResult.symbolNames,
             this._referencesResult.declarations,
-            this._cancellationToken,
             rootNode!,
-            /* treatModuleInImportAndFromImportSame */ true,
-            /* skipUnreachableCode */ false,
-            this._referencesResult.useCase
+            this._cancellationToken,
+            {
+                treatModuleInImportAndFromImportSame: true,
+                skipUnreachableCode: false,
+                useCase: this._referencesResult.useCase,
+                providers: this._referencesResult.providers,
+            }
         );
 
         for (const result of collector.collect()) {
             // Is it the same symbol?
             if (this._includeDeclaration || result.node !== this._referencesResult.nodeAtOffset) {
-                results.push({
-                    path: this._filePath,
-                    range: {
-                        start: convertOffsetToPosition(result.range.start, this._parseResults.tokenizerOutput.lines),
-                        end: convertOffsetToPosition(
-                            TextRange.getEnd(result.range),
-                            this._parseResults.tokenizerOutput.lines
-                        ),
-                    },
-                });
+                results.push(this._createDocumentRange(this._fileUri, result, this._parseResults));
             }
         }
 
         return results;
     }
+
+    static createDocumentRange(fileUri: Uri, result: CollectionResult, parseResults: ParseFileResults): DocumentRange {
+        return {
+            uri: fileUri,
+            range: {
+                start: convertOffsetToPosition(result.range.start, parseResults.tokenizerOutput.lines),
+                end: convertOffsetToPosition(TextRange.getEnd(result.range), parseResults.tokenizerOutput.lines),
+            },
+        };
+    }
 }
 
 export class ReferencesProvider {
-    constructor(private _program: ProgramView, private _token: CancellationToken) {
+    constructor(
+        private _program: ProgramView,
+        private _token: CancellationToken,
+        private readonly _createDocumentRange?: (
+            fileUri: Uri,
+            result: CollectionResult,
+            parseResults: ParseFileResults
+        ) => DocumentRange,
+        private readonly _convertToLocation?: (fs: ReadOnlyFileSystem, ranges: DocumentRange) => Location | undefined
+    ) {
         // empty
     }
 
     reportReferences(
-        filePath: string,
+        fileUri: Uri,
         position: Position,
         includeDeclaration: boolean,
         resultReporter?: ResultProgressReporter<Location[]>
     ) {
-        const sourceFileInfo = this._program.getSourceFileInfo(filePath);
+        const sourceFileInfo = this._program.getSourceFileInfo(fileUri);
         if (!sourceFileInfo) {
             return;
         }
 
-        const parseResults = this._program.getParseResults(filePath);
+        const parseResults = this._program.getParseResults(fileUri);
         if (!parseResults) {
             return;
         }
 
         const locations: Location[] = [];
         const reporter: ReferenceCallback = resultReporter
-            ? (range) => resultReporter.report(convertDocumentRangesToLocation(this._program.fileSystem, range))
-            : (range) => appendArray(locations, convertDocumentRangesToLocation(this._program.fileSystem, range));
+            ? (range) =>
+                  resultReporter.report(
+                      convertDocumentRangesToLocation(this._program.fileSystem, range, this._convertToLocation)
+                  )
+            : (range) =>
+                  appendArray(
+                      locations,
+                      convertDocumentRangesToLocation(this._program.fileSystem, range, this._convertToLocation)
+                  );
 
         const invokedFromUserFile = isUserCode(sourceFileInfo);
         const referencesResult = ReferencesProvider.getDeclarationForPosition(
             this._program,
-            filePath,
+            fileUri,
             position,
             reporter,
-            DocumentSymbolCollectorUseCase.Reference,
+            ReferenceUseCase.References,
             this._token
         );
         if (!referencesResult) {
@@ -185,7 +215,7 @@ export class ReferencesProvider {
 
         // Do we need to do a global search as well?
         if (!referencesResult.requiresGlobalSearch) {
-            this.addReferencesToResult(sourceFileInfo.sourceFile.getFilePath(), includeDeclaration, referencesResult);
+            this.addReferencesToResult(sourceFileInfo.sourceFile.getUri(), includeDeclaration, referencesResult);
         }
 
         for (const curSourceFileInfo of this._program.getSourceFileInfoList()) {
@@ -199,7 +229,7 @@ export class ReferencesProvider {
                 const fileContents = curSourceFileInfo.sourceFile.getFileContent();
                 if (!fileContents || referencesResult.symbolNames.some((s) => fileContents.search(s) >= 0)) {
                     this.addReferencesToResult(
-                        curSourceFileInfo.sourceFile.getFilePath(),
+                        curSourceFileInfo.sourceFile.getUri(),
                         includeDeclaration,
                         referencesResult
                     );
@@ -217,12 +247,12 @@ export class ReferencesProvider {
             for (const decl of referencesResult.declarations) {
                 throwIfCancellationRequested(this._token);
 
-                if (referencesResult.locations.some((l) => l.path === decl.path)) {
+                if (referencesResult.locations.some((l) => l.uri.equals(decl.uri))) {
                     // Already included.
                     continue;
                 }
 
-                const declFileInfo = this._program.getSourceFileInfo(decl.path);
+                const declFileInfo = this._program.getSourceFileInfo(decl.uri);
                 if (!declFileInfo) {
                     // The file the declaration belongs to doesn't belong to the program.
                     continue;
@@ -233,34 +263,47 @@ export class ReferencesProvider {
                     referencesResult.nodeAtOffset,
                     referencesResult.symbolNames,
                     referencesResult.declarations,
-                    referencesResult.useCase
+                    referencesResult.useCase,
+                    referencesResult.providers
                 );
 
-                this.addReferencesToResult(declFileInfo.sourceFile.getFilePath(), includeDeclaration, tempResult);
+                this.addReferencesToResult(declFileInfo.sourceFile.getUri(), includeDeclaration, tempResult);
                 for (const loc of tempResult.locations) {
                     // Include declarations only. And throw away any references
-                    if (loc.path === decl.path && doesRangeContain(decl.range, loc.range)) {
+                    if (loc.uri.equals(decl.uri) && doesRangeContain(decl.range, loc.range)) {
                         referencesResult.addLocations(loc);
                     }
                 }
             }
         }
 
-        return locations;
+        // Deduplicate locations before returning them.
+        const locationsSet = new Set<string>();
+        const dedupedLocations: Location[] = [];
+        for (const loc of locations) {
+            const key = `${loc.uri.toString()}:${loc.range.start.line}:${loc.range.start.character}`;
+            if (!locationsSet.has(key)) {
+                locationsSet.add(key);
+                dedupedLocations.push(loc);
+            }
+        }
+
+        return dedupedLocations;
     }
 
-    addReferencesToResult(filePath: string, includeDeclaration: boolean, referencesResult: ReferencesResult): void {
-        const parseResults = this._program.getParseResults(filePath);
+    addReferencesToResult(fileUri: Uri, includeDeclaration: boolean, referencesResult: ReferencesResult): void {
+        const parseResults = this._program.getParseResults(fileUri);
         if (!parseResults) {
             return;
         }
 
         const refTreeWalker = new FindReferencesTreeWalker(
             this._program,
-            filePath,
+            fileUri,
             referencesResult,
             includeDeclaration,
-            this._token
+            this._token,
+            this._createDocumentRange
         );
 
         referencesResult.addLocations(...refTreeWalker.findReferences());
@@ -268,10 +311,10 @@ export class ReferencesProvider {
 
     static getDeclarationForNode(
         program: ProgramView,
-        filePath: string,
+        fileUri: Uri,
         node: NameNode,
         reporter: ReferenceCallback | undefined,
-        useCase: DocumentSymbolCollectorUseCase,
+        useCase: ReferenceUseCase,
         token: CancellationToken
     ) {
         throwIfCancellationRequested(token);
@@ -280,7 +323,6 @@ export class ReferencesProvider {
             program,
             node,
             /* resolveLocalNames */ false,
-            useCase,
             token
         );
 
@@ -288,9 +330,19 @@ export class ReferencesProvider {
             return undefined;
         }
 
-        const requiresGlobalSearch = isVisibleOutside(program.evaluator!, filePath, node, declarations);
-        const symbolNames = new Set(declarations.map((d) => getNameFromDeclaration(d)!).filter((n) => !!n));
+        const requiresGlobalSearch = isVisibleOutside(program.evaluator!, fileUri, node, declarations);
+        const symbolNames = new Set<string>(declarations.map((d) => getNameFromDeclaration(d)!).filter((n) => !!n));
         symbolNames.add(node.value);
+
+        const providers = (program.serviceProvider.tryGet(ServiceKeys.symbolUsageProviderFactory) ?? [])
+            .map((f) => f.tryCreateProvider(useCase, declarations, token))
+            .filter(isDefined);
+
+        // Check whether we need to add new symbol names and declarations.
+        providers.forEach((p) => {
+            p.appendSymbolNamesTo(symbolNames);
+            p.appendDeclarationsTo(declarations);
+        });
 
         return new ReferencesResult(
             requiresGlobalSearch,
@@ -298,20 +350,21 @@ export class ReferencesProvider {
             Array.from(symbolNames.values()),
             declarations,
             useCase,
+            providers,
             reporter
         );
     }
 
     static getDeclarationForPosition(
         program: ProgramView,
-        filePath: string,
+        fileUri: Uri,
         position: Position,
         reporter: ReferenceCallback | undefined,
-        useCase: DocumentSymbolCollectorUseCase,
+        useCase: ReferenceUseCase,
         token: CancellationToken
     ): ReferencesResult | undefined {
         throwIfCancellationRequested(token);
-        const parseResults = program.getParseResults(filePath);
+        const parseResults = program.getParseResults(fileUri);
         if (!parseResults) {
             return undefined;
         }
@@ -321,7 +374,7 @@ export class ReferencesProvider {
             return undefined;
         }
 
-        const node = ParseTreeUtils.findNodeByOffset(parseResults.parseTree, offset);
+        const node = ParseTreeUtils.findNodeByOffset(parseResults.parserOutput.parseTree, offset);
         if (node === undefined) {
             return undefined;
         }
@@ -331,16 +384,11 @@ export class ReferencesProvider {
             return undefined;
         }
 
-        return this.getDeclarationForNode(program, filePath, node, reporter, useCase, token);
+        return this.getDeclarationForNode(program, fileUri, node, reporter, useCase, token);
     }
 }
 
-function isVisibleOutside(
-    evaluator: TypeEvaluator,
-    currentFilePath: string,
-    node: NameNode,
-    declarations: Declaration[]
-) {
+function isVisibleOutside(evaluator: TypeEvaluator, currentUri: Uri, node: NameNode, declarations: Declaration[]) {
     const result = evaluator.lookUpSymbolRecursive(node, node.value, /* honorCodeFlow */ false);
     if (result && !isExternallyVisible(result.symbol)) {
         return false;
@@ -353,11 +401,11 @@ function isVisibleOutside(
     // that is within the current file and cannot be imported directly from other modules.
     return declarations.some((decl) => {
         // If the declaration is outside of this file, a global search is needed.
-        if (decl.path !== currentFilePath) {
+        if (!decl.uri.equals(currentUri)) {
             return true;
         }
 
-        const evalScope = ParseTreeUtils.getEvaluationScopeNode(decl.node);
+        const evalScope = ParseTreeUtils.getEvaluationScopeNode(decl.node).node;
 
         // If the declaration is at the module level or a class level, it can be seen
         // outside of the current module, so a global search is needed.
@@ -425,7 +473,8 @@ function isVisibleOutside(
     // Return true if the scope that contains the specified node is visible
     // outside of the current module, false if not.
     function isContainerExternallyVisible(node: NameNode, recursionCount: number) {
-        const scopingNode = ParseTreeUtils.getEvaluationScopeNode(node);
+        const scopingNode = ParseTreeUtils.getEvaluationScopeNode(node).node;
+
         switch (scopingNode.nodeType) {
             case ParseNodeType.Class:
             case ParseNodeType.Function: {
@@ -435,7 +484,8 @@ function isVisibleOutside(
             }
 
             case ParseNodeType.Lambda:
-            case ParseNodeType.ListComprehension:
+            case ParseNodeType.Comprehension:
+            case ParseNodeType.TypeParameterList:
                 // Symbols in this scope can't be visible outside.
                 return false;
 

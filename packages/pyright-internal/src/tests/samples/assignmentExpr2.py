@@ -5,7 +5,7 @@
 
 import re
 
-def foo(x: float):
+def func1(x: float):
     ...
 
 def pep572_examples():
@@ -37,10 +37,31 @@ def pep572_examples():
     y0 = (y1 := f(25))  # Valid, though discouraged
 
     # This should generate an error.
-    foo(x = y := f(25))  # INVALID
-    foo(x=(y := f(25)))  # Valid, though probably confusing
+    func1(x = y := f(25))  # INVALID
+    func1(x=(y := f(25)))  # Valid, though probably confusing
 
     # This should generate an error.
     [y for x in [0, 1] if y := x - 1]
 
     [y for x in [0, 1] if (y := x - 1)]
+
+
+def func2():
+    # This should generate an error.
+    yield y := 1
+
+def func3():
+    # This should generate an error.
+    yield from y := [1]
+
+def func4():
+    # This should generate an error.
+    v1 = {x := 'a': 0}
+
+    v2 = {(x := 'a'): 0}
+
+    # This should generate an error.
+    v3 = {x := 'a': i for i in range(4)}
+
+    v4 = {(x := 'a'): i for i in range(4)}
+

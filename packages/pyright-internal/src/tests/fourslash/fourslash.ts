@@ -10,8 +10,8 @@
  * get ignored when test run due to how test code is injected when running.
  * see - server\pyright\server\src\tests\harness\fourslash\runner.ts@runCode - for more detail
  *
- * when run, helper variable will be bount to TestState (server\pyright\server\src\tests\harness\fourslash\testState.ts)
- * so make sure Foruslash type is in sync with TestState
+ * when run, helper variable will be bound to TestState (server\pyright\server\src\tests\harness\fourslash\testState.ts)
+ * so make sure Fourslash type is in sync with TestState
  *
  * for how markup language and helper is used in fourslash tests, see these 2 tests
  * server\pyright\server\src\tests\fourSlashParser.test.ts
@@ -234,6 +234,8 @@ declare namespace _ {
         ): Range[];
         getPositionRange(markerString: string): PositionRange;
         getPosition(markerString: string): Position;
+        get BOF(): number;
+        get EOF(): number;
         expandPositionRange(range: PositionRange, start: number, end: number): PositionRange;
         convertPositionRange(range: Range): PositionRange;
         convertPathToUri(path: string): string;
@@ -346,12 +348,18 @@ declare namespace _ {
             },
             isUntitled?: boolean
         ): void;
+        verifyTypeVerifierResults(
+            packageName: string,
+            ignoreUnknownTypesFromImports: boolean,
+            verboseOutput: boolean,
+            expected: object
+        ): void;
+
+        replace(start: number, length: number, text: string): void;
 
         /* not tested yet
         paste(text: string): void;
-
         type(text: string): void;
-        replace(start: number, length: number, text: string): void;
         deleteChar(count: number): void;
         deleteLineRange(startIndex: number, endIndexInclusive: number): void;
         deleteCharBehindMarker(count: number): void;
@@ -394,7 +402,6 @@ declare namespace Consts {
         createTypeStub = 'pyright.createtypestub',
         restartServer = 'pyright.restartserver',
         orderImports = 'pyright.organizeimports',
-        addMissingOptionalToParam = 'pyright.addoptionalforparam',
     }
 
     namespace DocumentHighlightKind {
@@ -447,4 +454,6 @@ declare namespace Consts {
     }
 
     export type InlayHintKind = 1 | 2;
+
+    export const IndexValueDetail = 'Index value';
 }

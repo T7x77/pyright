@@ -26,6 +26,7 @@ For absolute (non-relative) imports, Pyright employs the following resolution or
 
 5. Try to resolve using a **third-party typeshed** stub. If the `typeshedPath` is configured, use this instead of the typeshed stubs that are packaged with Pyright. This allows for the use of a newer or a patched version of the typeshed third-party stubs.
 
+6. For an absolute import, if all of the above attempts fail, attempt to import a module from the same directory as the importing file and parent directories that are also children of the root workspace. This accommodates cases where it is assumed that a Python script will be executed from one of these subdirectories rather than from the root directory.
 
 
 ### Configuring Your Python Environment
@@ -41,33 +42,21 @@ Pyright uses the following mechanisms (in priority order) to determine which Pyt
 
 ### Editable installs
 
-[PEP 660](https://peps.python.org/pep-0660/) enables build backends (e.g. setuptools) to
-use import hooks to direct the [import machinery](https://docs.python.org/3/reference/import.html)
-to the package’s source files rather than using a `.pth` file. Import hooks can provide
-an editable installation that is a more accurate representation of your real installation.
-However, because resolving module locations using an import hook requires executing Python
-code, they are not usable by Pyright and other static analysis tools. Therefore, if your
-editable install is configured to use import hooks, Pyright will be unable to find the
-corresponding source files.
+If you want to use static analysis tools with an editable install, you should configure the editable install to use `.pth` files that contain file paths rather than executable lines (prefixed with `import`) that install import hooks. See your package manager’s documentation for details on how to do this. We have provided some basic information for common package managers below.
 
-If you want to use static analysis tools with an editable install, you should configure
-the editable install to use `.pth` files instead of import hooks. See your build backend’s
-documentation for details on how to do this. We have provided some basic information for
-common build backends below.
+Import hooks can provide an editable installation that is a more accurate representation of your real installation. However, because resolving module locations using an import hook requires executing Python code, they are not usable by Pyright and other static analysis tools. Therefore, if your editable install is configured to use import hooks, Pyright will be unable to find the corresponding source files.
 
-#### Setuptools
-Setuptools currently supports two ways to request:
-[“compat mode”](https://setuptools.pypa.io/en/latest/userguide/development_mode.html#legacy-behavior)
-where a `.pth` file will be used -- a config setting and an environment variable. Another
-option is [“strict mode”](https://setuptools.pypa.io/en/latest/userguide/development_mode.html#strict-editable-installs)
-which uses symlinks instead.
+#### pip / setuptools
+`pip` (`setuptools`) supports two ways to avoid import hooks:
+- [compat mode](https://setuptools.pypa.io/en/latest/userguide/development_mode.html#legacy-behavior)
+- [strict mode](https://setuptools.pypa.io/en/latest/userguide/development_mode.html#strict-editable-installs)
 
-#### Hatch/Hatchling
-[Hatchling](https://hatch.pypa.io/latest/config/build/#dev-mode) uses `.pth` files by
+#### Hatch / Hatchling
+[Hatchling](https://hatch.pypa.io/latest/config/build/#dev-mode) uses path-based `.pth` files by
 default. It will only use import hooks if you set `dev-mode-exact` to `true`.
 
 #### PDM
-[PDM](https://pdm.fming.dev/latest/pyproject/build/#editable-build-backend) uses `.pth`
+[PDM](https://pdm.fming.dev/latest/pyproject/build/#editable-build-backend) uses path-based `.pth`
 files by default. It will only use import hooks if you set `editable-backend` to
 `"editables"`.
 

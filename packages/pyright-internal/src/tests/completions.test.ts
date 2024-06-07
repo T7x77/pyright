@@ -8,6 +8,7 @@ import assert from 'assert';
 import { CancellationToken } from 'vscode-languageserver';
 import { CompletionItemKind, MarkupKind } from 'vscode-languageserver-types';
 
+import { Uri } from '../common/uri/uri';
 import { CompletionOptions, CompletionProvider } from '../languageService/completionProvider';
 import { parseAndGetTestState } from './harness/fourslash/testState';
 
@@ -798,6 +799,7 @@ test('completion quote trigger', async () => {
     const state = parseAndGetTestState(code).state;
     const marker = state.getMarkerByName('marker');
     const filePath = marker.fileName;
+    const uri = Uri.file(filePath, state.serviceProvider);
     const position = state.convertOffsetToPosition(filePath, marker.position);
 
     const options: CompletionOptions = {
@@ -809,8 +811,7 @@ test('completion quote trigger', async () => {
 
     const result = new CompletionProvider(
         state.program,
-        state.workspace.rootPath,
-        filePath,
+        uri,
         position,
         options,
         CancellationToken.None
@@ -836,6 +837,7 @@ test('completion quote trigger - middle', async () => {
     const state = parseAndGetTestState(code).state;
     const marker = state.getMarkerByName('marker');
     const filePath = marker.fileName;
+    const uri = Uri.file(filePath, state.serviceProvider);
     const position = state.convertOffsetToPosition(filePath, marker.position);
 
     const options: CompletionOptions = {
@@ -847,8 +849,7 @@ test('completion quote trigger - middle', async () => {
 
     const result = new CompletionProvider(
         state.program,
-        state.workspace.rootPath,
-        filePath,
+        uri,
         position,
         options,
         CancellationToken.None
@@ -882,6 +883,7 @@ test('auto import sort text', async () => {
     while (state.workspace.service.test_program.analyze());
 
     const filePath = marker.fileName;
+    const uri = Uri.file(filePath, state.serviceProvider);
     const position = state.convertOffsetToPosition(filePath, marker.position);
 
     const options: CompletionOptions = {
@@ -892,8 +894,7 @@ test('auto import sort text', async () => {
 
     const result = new CompletionProvider(
         state.program,
-        state.workspace.rootPath,
-        filePath,
+        uri,
         position,
         options,
         CancellationToken.None
@@ -1147,7 +1148,7 @@ test('Enum member', async () => {
                 {
                     label: 'this',
                     kind: CompletionItemKind.EnumMember,
-                    documentation: '```python\nthis: Literal[MyEnum.this]\n```',
+                    documentation: '```python\nthis: int\n```',
                 },
             ],
         },
@@ -1168,7 +1169,136 @@ test('no member of Enum member', async () => {
 
     const state = parseAndGetTestState(code).state;
 
-    await state.verifyCompletion('exact', 'markdown', {
-        ['marker']: { completions: [] },
+    await state.verifyCompletion('excluded', 'markdown', {
+        ['marker']: {
+            completions: [
+                {
+                    label: 'this',
+                    kind: undefined,
+                },
+                {
+                    label: 'that',
+                    kind: undefined,
+                },
+            ],
+        },
+    });
+});
+
+test('default Enum member', async () => {
+    const code = `
+// @filename: test.py
+//// from enum import Enum
+//// 
+//// class MyEnum(Enum):
+////     MemberOne = []
+//// 
+//// MyEnum.MemberOne.[|/*marker*/|]
+    `;
+
+    const state = parseAndGetTestState(code).state;
+
+    await state.verifyCompletion('included', 'markdown', {
+        ['marker']: {
+            completions: [
+                {
+                    label: 'name',
+                    kind: CompletionItemKind.Property,
+                },
+                {
+                    label: 'value',
+                    kind: CompletionItemKind.Property,
+                },
+            ],
+        },
+    });
+});
+
+test('TypeDict literal values', async () => {
+    const code = `
+// @filename: test.py
+//// from typing import TypedDict, Literal
+//// 
+//// class DataA(TypedDict):
+////     name: Literal["a", "b"] | None
+//// 
+//// data_a: DataA = {
+////     "name": [|"/*marker*/"|]
+//// }
+    `;
+
+    const state = parseAndGetTestState(code).state;
+
+    await state.verifyCompletion('included', 'markdown', {
+        ['marker']: {
+            completions: [
+                {
+                    label: '"a"',
+                    kind: CompletionItemKind.Constant,
+                    textEdit: { range: state.getPositionRange('marker'), newText: '"a"' },
+                },
+                {
+                    label: '"b"',
+                    kind: CompletionItemKind.Constant,
+                    textEdit: { range: state.getPositionRange('marker'), newText: '"b"' },
+                },
+            ],
+        },
+    });
+});
+
+test('typed dict key constructor completion', async () => {
+    const code = `
+// @filename: test.py
+//// from typing import TypedDict
+//// 
+//// class Movie(TypedDict):
+////    key1: str
+//// 
+//// a = Movie(k[|"/*marker*/"|])
+//// 
+    `;
+
+    const state = parseAndGetTestState(code).state;
+
+    await state.verifyCompletion('included', MarkupKind.Markdown, {
+        marker: {
+            completions: [
+                {
+                    kind: CompletionItemKind.Variable,
+                    label: 'key1=',
+                },
+            ],
+        },
+    });
+});
+
+test('import from completion for namespace package', async () => {
+    const code = `
+// @filename: test.py
+//// from nest1 import [|/*marker*/|]
+
+// @filename: nest1/nest2/__init__.py
+//// # empty
+
+// @filename: nest1/module.py
+//// # empty
+    `;
+
+    const state = parseAndGetTestState(code).state;
+
+    await state.verifyCompletion('included', 'markdown', {
+        ['marker']: {
+            completions: [
+                {
+                    label: 'nest2',
+                    kind: CompletionItemKind.Module,
+                },
+                {
+                    label: 'module',
+                    kind: CompletionItemKind.Module,
+                },
+            ],
+        },
     });
 });

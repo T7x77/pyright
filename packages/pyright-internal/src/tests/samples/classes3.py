@@ -27,7 +27,7 @@ text_signature = TestClass.__text_signature__
 subclasses = TestClass.__subclasses__
 
 
-# This should generate an error
+# This should generate an error.
 dummy = TestClass.__dummy__
 
 instance = TestClass()
@@ -35,8 +35,12 @@ instance = TestClass()
 instance.__doc__
 instance.__module__
 
-# These should generate an error because they are not visible to instances.
+# This should generate an error.
 instance.__name__
+
+# This should generate an error, but it doesn't currently. That's because
+# the binder manually adds __qualname__ to a class's symbol table to make
+# it available within a class body.
 instance.__qualname__
 
 
@@ -47,7 +51,7 @@ class Meta(type):
 
 class NonMeta:
     def method1(self) -> str:
-        # This should generate an error
+        # This should generate an error.
         return self.__name__
 
 

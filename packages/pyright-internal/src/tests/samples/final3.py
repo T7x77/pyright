@@ -2,7 +2,9 @@
 # introduced in Python 3.8.
 
 import typing
-from typing import Any, Final
+from typing import Any, Final, Protocol, TypeVar
+
+T = TypeVar("T")
 
 foo1: typing.Final = 3
 
@@ -49,6 +51,11 @@ class Foo:
 
     _member7: Final = 6
     __member8: Final = 6
+
+    member9: Final = 2
+
+    # This should generate an error.
+    member9 = 3
 
     def __init__(self, a: bool):
         # This should generate an error because a Final
@@ -114,6 +121,8 @@ b: list[Final[int]] = []
 class ClassA:
     member1: Final = 3
     member2: Final
+    member4: Final
+    member5: Final = 3
 
     def __init__(self):
         # This should generate an error.
@@ -122,6 +131,12 @@ class ClassA:
         self.member2 = "hi"
 
         self.member3: Final = "hi"
+
+        # This should generate an error.
+        ClassA.member4 = "hi"
+
+        # This should generate an error.
+        ClassA.member5 = 3
 
     def other(self):
         # This should generate an error.
@@ -177,3 +192,29 @@ class ClassB:
     def method1(self):
         # This should generate an error because x is Final.
         self.x += 1
+
+
+class ClassC(Protocol):
+    x: Final[int]
+
+
+def func3(x: type[T]) -> T:
+    return x()
+
+
+# This should generate two errors because Final isn't compatible with type.
+func3(Final[int])
+
+
+foo5: Final = lambda: None
+
+
+# This should generate an error because foo5 is declared as Final.
+def foo5() -> None:
+    pass
+
+
+# This should generate an error because ClassVar is Final.
+from typing import ClassVar
+
+ClassVar: Final = 3

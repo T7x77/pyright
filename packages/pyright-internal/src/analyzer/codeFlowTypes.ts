@@ -131,6 +131,7 @@ export interface FlowNarrowForPattern extends FlowNode {
 // (i.e. the narrowed type of the subject expression is Never at the bottom).
 export interface FlowExhaustedMatch extends FlowNode {
     node: MatchNode;
+    subjectExpression: ExpressionNode;
     antecedent: FlowNode;
 }
 
@@ -145,7 +146,6 @@ export interface FlowCall extends FlowNode {
 // explanation of the FlowPreFinally and FlowPostFinally nodes.
 export interface FlowPreFinallyGate extends FlowNode {
     antecedent: FlowNode;
-    isGateClosed: boolean;
 }
 
 export interface FlowPostFinally extends FlowNode {

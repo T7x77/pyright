@@ -8,45 +8,59 @@
  */
 
 import { assert } from '../common/debug';
-import {
-    ArgumentCategory,
-    AssignmentNode,
-    ExpressionNode,
-    NameNode,
-    ParseNode,
-    ParseNodeType,
-} from '../parser/parseNodes';
+import { ArgumentCategory, ExpressionNode, NameNode, ParseNode, ParseNodeType } from '../parser/parseNodes';
 import { getFileInfo } from './analyzerNodeInfo';
 import { VariableDeclaration } from './declaration';
-import {
-    getClassFullName,
-    getEnclosingClass,
-    getParentNodeOfType,
-    getTypeSourceId,
-    isNodeContainedWithin,
-} from './parseTreeUtils';
+import { getClassFullName, getEnclosingClass, getTypeSourceId } from './parseTreeUtils';
 import { Symbol, SymbolFlags } from './symbol';
-import { isSingleDunderName } from './symbolNameUtils';
-import { FunctionArgument, TypeEvaluator } from './typeEvaluatorTypes';
+import { isPrivateName, isSingleDunderName } from './symbolNameUtils';
+import { EvaluatorFlags, FunctionArgument, TypeEvaluator, TypeResult } from './typeEvaluatorTypes';
 import { enumerateLiteralsForType } from './typeGuards';
-import { ClassMemberLookupFlags, computeMroLinearization, lookUpClassMember } from './typeUtils';
+import { MemberAccessFlags, computeMroLinearization, lookUpClassMember, makeInferenceContext } from './typeUtils';
 import {
     AnyType,
     ClassType,
     ClassTypeFlags,
     EnumLiteral,
     Type,
+    TypeBase,
     UnknownType,
     combineTypes,
+    findSubtype,
+    isAny,
     isClass,
     isClassInstance,
     isFunction,
     isInstantiableClass,
+    isOverloadedFunction,
+    maxTypeRecursionCount,
 } from './types';
 
-export function isKnownEnumType(className: string) {
-    const knownEnumTypes = ['Enum', 'IntEnum', 'StrEnum', 'Flag', 'IntFlag'];
-    return knownEnumTypes.some((c) => c === className);
+// Determines whether the class is an Enum metaclass or a subclass thereof.
+export function isEnumMetaclass(classType: ClassType) {
+    return classType.details.mro.some(
+        (mroClass) => isClass(mroClass) && ClassType.isBuiltIn(mroClass, ['EnumMeta', 'EnumType'])
+    );
+}
+
+// Determines whether this is an enum class that has at least one enum
+// member defined.
+export function isEnumClassWithMembers(evaluator: TypeEvaluator, classType: ClassType) {
+    if (!isClass(classType) || !ClassType.isEnumClass(classType)) {
+        return false;
+    }
+
+    // Determine whether the enum class defines a member.
+    let definesMember = false;
+
+    ClassType.getSymbolTable(classType).forEach((symbol, name) => {
+        const symbolType = transformTypeForEnumMember(evaluator, classType, name);
+        if (symbolType && isClassInstance(symbolType) && ClassType.isSameGenericClass(symbolType, classType)) {
+            definesMember = true;
+        }
+    });
+
+    return definesMember;
 }
 
 // Creates a new custom enum class with named values.
@@ -78,8 +92,8 @@ export function createEnumType(
         className,
         getClassFullName(errorNode, fileInfo.moduleName, className),
         fileInfo.moduleName,
-        fileInfo.filePath,
-        ClassTypeFlags.EnumClass,
+        fileInfo.fileUri,
+        ClassTypeFlags.EnumClass | ClassTypeFlags.ValidTypeAliasClass,
         getTypeSourceId(errorNode),
         /* declaredMetaclass */ undefined,
         enumClass.details.effectiveMetaclass
@@ -87,7 +101,7 @@ export function createEnumType(
     classType.details.baseClasses.push(enumClass);
     computeMroLinearization(classType);
 
-    const classFields = classType.details.fields;
+    const classFields = ClassType.getSymbolTable(classType);
     classFields.set(
         '__class__',
         Symbol.createWithType(SymbolFlags.ClassMember | SymbolFlags.IgnoredForProtocolMatch, classType)
@@ -115,7 +129,7 @@ export function createEnumType(
     //   Enum('name', ('a', 'b', 'c'))
     //   Enum('name', (('a', 1), ('b', 2), ('c', 3)))
     //   Enum('name', [('a', 1), ('b', 2), ('c', 3))]
-    //   Enum('name', {'a': 1, 'b': 2, 'c': 3}
+    //   Enum('name', {'a': 1, 'b': 2, 'c': 3})
     if (initArg.valueExpression.nodeType === ParseNodeType.StringList) {
         // Don't allow format strings in the init arg.
         if (!initArg.valueExpression.strings.every((str) => str.nodeType === ParseNodeType.String)) {
@@ -269,100 +283,203 @@ export function createEnumType(
     return classType;
 }
 
-export function transformTypeForPossibleEnumClass(
+// Performs the "magic" that the Enum metaclass does at runtime when it
+// transforms a value into an enum instance. If the specified name isn't
+// an enum member, this function returns undefined indicating that the
+// Enum metaclass does not transform the value.
+// By default, if a type annotation is present, the member is not treated
+// as a member of the enumeration, but the Enum metaclass ignores such
+// annotations. The typing spec indicates that the use of an annotation is
+// illegal, so we need to detect this case and report an error.
+export function transformTypeForEnumMember(
     evaluator: TypeEvaluator,
-    node: NameNode,
-    getValueType: () => Type
+    classType: ClassType,
+    memberName: string,
+    ignoreAnnotation = false,
+    recursionCount = 0
 ): Type | undefined {
-    // If the node is within a class that derives from the metaclass
-    // "EnumMeta", we need to treat assignments differently.
-    const enclosingClassNode = getEnclosingClass(node, /* stopAtFunction */ true);
-    if (!enclosingClassNode) {
+    if (recursionCount > maxTypeRecursionCount) {
+        return undefined;
+    }
+    recursionCount++;
+
+    if (!ClassType.isEnumClass(classType)) {
         return undefined;
     }
 
-    const enumClassInfo = evaluator.getTypeOfClass(enclosingClassNode);
-    if (!enumClassInfo || !ClassType.isEnumClass(enumClassInfo.classType)) {
+    const memberInfo = lookUpClassMember(classType, memberName);
+    if (!memberInfo || !isClass(memberInfo.classType) || !ClassType.isEnumClass(memberInfo.classType)) {
         return undefined;
     }
 
-    // In ".py" files, the transform applies only to members that are
-    // assigned within the class. In stub files, it applies to most variables
-    // even if they are not assigned. This unfortunate convention means
-    // there is no way in a stub to specify both enum members and instance
-    // variables used within each enum instance. Unless/until there is
-    // a change to this convention and all type checkers and stubs adopt
-    // it, we're stuck with this limitation.
+    const decls = memberInfo.symbol.getDeclarations();
+    if (decls.length < 1) {
+        return undefined;
+    }
+
+    const primaryDecl = decls[0];
+
     let isMemberOfEnumeration = false;
     let isUnpackedTuple = false;
+    let valueTypeExprNode: ExpressionNode | undefined;
+    let declaredTypeNode: ExpressionNode | undefined;
+    let nameNode: NameNode | undefined;
 
-    const assignmentNode = getParentNodeOfType(node, ParseNodeType.Assignment) as AssignmentNode | undefined;
+    if (primaryDecl.node.nodeType === ParseNodeType.Name) {
+        nameNode = primaryDecl.node;
+    } else if (primaryDecl.node.nodeType === ParseNodeType.Function) {
+        // Handle the case where a method is decorated with @enum.member.
+        nameNode = primaryDecl.node.name;
+    } else {
+        return undefined;
+    }
 
-    if (assignmentNode && isNodeContainedWithin(node, assignmentNode.leftExpression)) {
+    if (nameNode.parent?.nodeType === ParseNodeType.Assignment && nameNode.parent.leftExpression === nameNode) {
         isMemberOfEnumeration = true;
-
-        if (getParentNodeOfType(node, ParseNodeType.Tuple)) {
-            isUnpackedTuple = true;
-        }
+        valueTypeExprNode = nameNode.parent.rightExpression;
     } else if (
-        getFileInfo(node).isStubFile &&
-        node.parent?.nodeType === ParseNodeType.TypeAnnotation &&
-        node.parent.valueExpression === node
+        nameNode.parent?.nodeType === ParseNodeType.Tuple &&
+        nameNode.parent.parent?.nodeType === ParseNodeType.Assignment
     ) {
         isMemberOfEnumeration = true;
+        isUnpackedTuple = true;
+        valueTypeExprNode = nameNode.parent.parent.rightExpression;
+    } else if (
+        nameNode.parent?.nodeType === ParseNodeType.TypeAnnotation &&
+        nameNode.parent.valueExpression === nameNode
+    ) {
+        if (ignoreAnnotation) {
+            isMemberOfEnumeration = true;
+        }
+        declaredTypeNode = nameNode.parent.typeAnnotation;
     }
 
     // The spec specifically excludes names that start and end with a single underscore.
     // This also includes dunder names.
-    if (isSingleDunderName(node.value)) {
-        isMemberOfEnumeration = false;
+    if (isSingleDunderName(memberName)) {
+        return undefined;
     }
 
     // Specifically exclude "value" and "name". These are reserved by the enum metaclass.
-    if (node.value === 'name' || node.value === 'value') {
-        isMemberOfEnumeration = false;
+    if (memberName === 'name' || memberName === 'value') {
+        return undefined;
     }
 
-    let valueType: Type;
+    const declaredType = declaredTypeNode ? evaluator.getTypeOfAnnotation(declaredTypeNode) : undefined;
+    let assignedType: Type | undefined;
 
-    // If the class includes a __new__ method, we cannot assume that
-    // the value of each enum element is simply the value assigned to it.
-    // The __new__ method can transform the value in ways that we cannot
-    // determine statically.
-    const newMember = lookUpClassMember(enumClassInfo.classType, '__new__', ClassMemberLookupFlags.SkipBaseClasses);
-    if (newMember) {
-        // We may want to change this to UnknownType in the future, but
-        // for now, we'll leave it as Any which is consistent with the
-        // type specified in the Enum class definition in enum.pyi.
-        valueType = AnyType.create();
-    } else {
-        valueType = getValueType();
+    if (valueTypeExprNode) {
+        const evalFlags = getFileInfo(valueTypeExprNode).isStubFile ? EvaluatorFlags.ConvertEllipsisToAny : undefined;
+        assignedType = evaluator.getTypeOfExpression(valueTypeExprNode, evalFlags).type;
+    }
 
-        // If the LHS is an unpacked tuple, we need to handle this as
-        // a special case.
-        if (isUnpackedTuple) {
-            valueType =
-                evaluator.getTypeOfIterator({ type: valueType }, /* isAsync */ false, /* errorNode */ undefined)
-                    ?.type ?? UnknownType.create();
+    // Handle aliases to other enum members within the same enum.
+    if (valueTypeExprNode?.nodeType === ParseNodeType.Name && valueTypeExprNode.value !== memberName) {
+        const aliasedEnumType = transformTypeForEnumMember(
+            evaluator,
+            classType,
+            valueTypeExprNode.value,
+            /* ignoreAnnotation */ false,
+            recursionCount
+        );
+
+        if (
+            aliasedEnumType &&
+            isClassInstance(aliasedEnumType) &&
+            ClassType.isSameGenericClass(aliasedEnumType, ClassType.cloneAsInstance(memberInfo.classType)) &&
+            aliasedEnumType.literalValue !== undefined
+        ) {
+            return aliasedEnumType;
         }
     }
 
+    if (primaryDecl.node.nodeType === ParseNodeType.Function) {
+        const functionType = evaluator.getTypeOfFunction(primaryDecl.node);
+        if (functionType) {
+            assignedType = functionType.decoratedType;
+        }
+    }
+
+    let valueType = declaredType ?? assignedType ?? UnknownType.create();
+
+    // If the LHS is an unpacked tuple, we need to handle this as
+    // a special case.
+    if (isUnpackedTuple) {
+        valueType =
+            evaluator.getTypeOfIterator(
+                { type: valueType },
+                /* isAsync */ false,
+                nameNode,
+                /* emitNotIterableError */ false
+            )?.type ?? UnknownType.create();
+    }
+
     // The spec excludes descriptors.
-    if (isClassInstance(valueType) && valueType.details.fields.get('__get__')) {
-        isMemberOfEnumeration = false;
+    if (isClassInstance(valueType) && ClassType.getSymbolTable(valueType).get('__get__')) {
+        return undefined;
     }
 
-    if (isMemberOfEnumeration) {
-        const enumLiteral = new EnumLiteral(
-            enumClassInfo.classType.details.fullName,
-            enumClassInfo.classType.details.name,
-            node.value,
-            valueType
-        );
-        return ClassType.cloneAsInstance(ClassType.cloneWithLiteral(enumClassInfo.classType, enumLiteral));
+    // The spec excludes private (mangled) names.
+    if (isPrivateName(memberName)) {
+        return undefined;
     }
 
-    return undefined;
+    // The enum spec doesn't explicitly specify this, but it
+    // appears that callables are excluded.
+    if (!findSubtype(valueType, (subtype) => !isFunction(subtype) && !isOverloadedFunction(subtype))) {
+        return undefined;
+    }
+
+    if (
+        !assignedType &&
+        nameNode.parent?.nodeType === ParseNodeType.Assignment &&
+        nameNode.parent.leftExpression === nameNode
+    ) {
+        assignedType = evaluator.getTypeOfExpression(
+            nameNode.parent.rightExpression,
+            /* flags */ undefined,
+            makeInferenceContext(declaredType)
+        ).type;
+    }
+
+    // Handle the Python 3.11 "enum.member()" and "enum.nonmember()" features.
+    if (assignedType && isClassInstance(assignedType) && ClassType.isBuiltIn(assignedType)) {
+        if (assignedType.details.fullName === 'enum.nonmember') {
+            const nonMemberType =
+                assignedType.typeArguments && assignedType.typeArguments.length > 0
+                    ? assignedType.typeArguments[0]
+                    : UnknownType.create();
+
+            // If the type of the nonmember is declared and the assigned value has
+            // a compatible type, use the declared type.
+            if (declaredType && evaluator.assignType(declaredType, nonMemberType)) {
+                return declaredType;
+            }
+
+            return nonMemberType;
+        }
+
+        if (assignedType.details.fullName === 'enum.member') {
+            valueType =
+                assignedType.typeArguments && assignedType.typeArguments.length > 0
+                    ? assignedType.typeArguments[0]
+                    : UnknownType.create();
+            isMemberOfEnumeration = true;
+        }
+    }
+
+    if (!isMemberOfEnumeration) {
+        return undefined;
+    }
+
+    const enumLiteral = new EnumLiteral(
+        memberInfo.classType.details.fullName,
+        memberInfo.classType.details.name,
+        memberName,
+        valueType
+    );
+
+    return ClassType.cloneAsInstance(ClassType.cloneWithLiteral(memberInfo.classType, enumLiteral));
 }
 
 export function isDeclInEnumClass(evaluator: TypeEvaluator, decl: VariableDeclaration): boolean {
@@ -379,21 +496,65 @@ export function isDeclInEnumClass(evaluator: TypeEvaluator, decl: VariableDeclar
     return ClassType.isEnumClass(classInfo.classType);
 }
 
+export function getEnumDeclaredValueType(
+    evaluator: TypeEvaluator,
+    classType: ClassType,
+    declaredTypesOnly = false
+): Type | undefined {
+    // See if there is a declared type for "_value_".
+    let valueType: Type | undefined;
+
+    const declaredValueMember = lookUpClassMember(
+        classType,
+        '_value_',
+        declaredTypesOnly ? MemberAccessFlags.DeclaredTypesOnly : MemberAccessFlags.Default
+    );
+
+    // If the declared type comes from the 'Enum' base class, ignore it
+    // because it will be "Any", which isn't useful to us here.
+    if (
+        declaredValueMember &&
+        declaredValueMember.classType &&
+        isClass(declaredValueMember.classType) &&
+        !ClassType.isBuiltIn(declaredValueMember.classType, 'Enum')
+    ) {
+        valueType = evaluator.getTypeOfMember(declaredValueMember);
+    }
+
+    return valueType;
+}
+
 export function getTypeOfEnumMember(
     evaluator: TypeEvaluator,
     errorNode: ParseNode,
     classType: ClassType,
     memberName: string,
     isIncomplete: boolean
-) {
-    // Handle the special case of 'name' and 'value' members within an enum.
+): TypeResult | undefined {
     if (!ClassType.isEnumClass(classType)) {
         return undefined;
     }
 
+    const type = transformTypeForEnumMember(evaluator, classType, memberName);
+    if (type) {
+        return { type, isIncomplete };
+    }
+
+    if (TypeBase.isInstantiable(classType)) {
+        return undefined;
+    }
+
+    // Handle the special case of 'name' and 'value' members within an enum.
     const literalValue = classType.literalValue;
 
     if (memberName === 'name' || memberName === '_name_') {
+        // Does the class explicitly override this member? Or it it using the
+        // standard behavior provided by the "Enum" class?
+        const memberInfo = lookUpClassMember(classType, memberName);
+        if (memberInfo && isClass(memberInfo.classType) && !ClassType.isBuiltIn(memberInfo.classType, 'Enum')) {
+            return undefined;
+        }
+
         const strClass = evaluator.getBuiltInType(errorNode, 'str');
         if (!isInstantiableClass(strClass)) {
             return undefined;
@@ -425,18 +586,57 @@ export function getTypeOfEnumMember(
         }
     }
 
+    // See if there is a declared type for "_value_".
+    const valueType = getEnumDeclaredValueType(evaluator, classType);
+
     if (memberName === 'value' || memberName === '_value_') {
-        // If the enum class has a custom metaclass, it may implement some
-        // "magic" that computes different values for the "value" attribute.
-        // This occurs, for example, in the django TextChoices class. If we
-        // detect a custom metaclass, we'll assume the value is Any.
-        const metaclass = classType.details.effectiveMetaclass;
-        if (metaclass && isClass(metaclass) && !ClassType.isBuiltIn(metaclass)) {
-            return { type: AnyType.create(), isIncomplete };
+        // Does the class explicitly override this member? Or it it using the
+        // standard behavior provided by the "Enum" class and other built-in
+        // subclasses like "StrEnum" and "IntEnum"?
+        const memberInfo = lookUpClassMember(classType, memberName);
+        if (memberInfo && isClass(memberInfo.classType) && !ClassType.isBuiltIn(memberInfo.classType)) {
+            return undefined;
         }
 
+        // If the enum class has a custom metaclass, it may implement some
+        // "magic" that computes different values for the "_value_" attribute.
+        // This occurs, for example, in the django TextChoices class. If we
+        // detect a custom metaclass, we'll use the declared type of _value_
+        // if it is declared.
+        const metaclass = classType.details.effectiveMetaclass;
+        if (metaclass && isClass(metaclass) && !ClassType.isBuiltIn(metaclass)) {
+            return { type: valueType ?? AnyType.create(), isIncomplete };
+        }
+
+        // If the enum class has a custom __new__ or __init__ method,
+        // it may implement some magic that computes different values for
+        // the "_value_" attribute. If we see a customer __new__ or __init__,
+        // we'll assume the value type is what we computed above, or Any.
+        const newMember = lookUpClassMember(classType, '__new__', MemberAccessFlags.SkipObjectBaseClass);
+        const initMember = lookUpClassMember(classType, '__init__', MemberAccessFlags.SkipObjectBaseClass);
+
+        if (newMember && isClass(newMember.classType) && !ClassType.isBuiltIn(newMember.classType)) {
+            return { type: valueType ?? AnyType.create(), isIncomplete };
+        }
+
+        if (initMember && isClass(initMember.classType) && !ClassType.isBuiltIn(initMember.classType)) {
+            return { type: valueType ?? AnyType.create(), isIncomplete };
+        }
+
+        // There were no explicit assignments to the "_value_" attribute, so we can
+        // assume that the values are assigned directly to the "_value_" by
+        // the EnumMeta metaclass.
         if (literalValue) {
             assert(literalValue instanceof EnumLiteral);
+
+            // If there is no known value type for this literal value,
+            // return undefined. This will cause the caller to fall back
+            // on the definition of "_value_" within the class definition
+            // (if present).
+            if (isAny(literalValue.itemType)) {
+                return valueType ? { type: valueType, isIncomplete } : undefined;
+            }
+
             return { type: literalValue.itemType, isIncomplete };
         }
 
@@ -466,7 +666,7 @@ export function getEnumAutoValueType(evaluator: TypeEvaluator, node: ExpressionN
     if (containingClassNode) {
         const classTypeInfo = evaluator.getTypeOfClass(containingClassNode);
         if (classTypeInfo) {
-            const memberInfo = evaluator.getTypeOfObjectMember(
+            const memberInfo = evaluator.getTypeOfBoundMember(
                 node,
                 ClassType.cloneAsInstance(classTypeInfo.classType),
                 '_generate_next_value_'
@@ -477,6 +677,7 @@ export function getEnumAutoValueType(evaluator: TypeEvaluator, node: ExpressionN
             // returning an "Any" type in the typeshed stubs.
             if (
                 memberInfo &&
+                !memberInfo.typeErrors &&
                 isFunction(memberInfo.type) &&
                 memberInfo.classType &&
                 isClass(memberInfo.classType) &&

@@ -11,7 +11,7 @@
 import { assert } from '../common/debug';
 import { DiagnosticAddendum } from '../common/diagnostic';
 import { DiagnosticRule } from '../common/diagnosticRules';
-import { Localizer } from '../localization/localize';
+import { LocMessage } from '../localization/localize';
 import {
     ArgumentCategory,
     ArgumentNode,
@@ -26,14 +26,14 @@ import {
 } from '../parser/parseNodes';
 import * as AnalyzerNodeInfo from './analyzerNodeInfo';
 import { getFileInfo } from './analyzerNodeInfo';
-import { createFunctionFromConstructor } from './constructors';
+import { createFunctionFromConstructor, getBoundInitMethod } from './constructors';
 import { DeclarationType } from './declaration';
 import { updateNamedTupleBaseClass } from './namedTuples';
 import { getClassFullName, getEnclosingClassOrFunction, getScopeIdForNode, getTypeSourceId } from './parseTreeUtils';
 import { evaluateStaticBoolExpression } from './staticExpressions';
 import { Symbol, SymbolFlags } from './symbol';
 import { isPrivateName } from './symbolNameUtils';
-import { EvaluatorFlags, FunctionArgument, TypeEvaluator } from './typeEvaluatorTypes';
+import { EvaluatorFlags, FunctionArgument, TypeEvaluator, TypeResult } from './typeEvaluatorTypes';
 import {
     AnyType,
     ClassType,
@@ -49,7 +49,7 @@ import {
     isFunction,
     isInstantiableClass,
     isOverloadedFunction,
-    NoneType,
+    isUnion,
     OverloadedFunctionType,
     TupleTypeArgument,
     Type,
@@ -61,9 +61,11 @@ import {
     buildTypeVarContextFromSpecializedClass,
     computeMroLinearization,
     convertToInstance,
+    doForEachSignature,
     getTypeVarScopeId,
+    getTypeVarScopeIds,
     isLiteralType,
-    lookUpObjectMember,
+    isMetaclassInstance,
     populateTypeVarContextForSelfType,
     requiresSpecialization,
     specializeTupleClass,
@@ -78,6 +80,7 @@ export function synthesizeDataClassMethods(
     evaluator: TypeEvaluator,
     node: ClassNode,
     classType: ClassType,
+    isNamedTuple: boolean,
     skipSynthesizeInit: boolean,
     hasExistingInitMethod: boolean,
     skipSynthesizeHash: boolean
@@ -86,18 +89,23 @@ export function synthesizeDataClassMethods(
 
     const classTypeVar = synthesizeTypeVarForSelfCls(classType, /* isClsParam */ true);
     const newType = FunctionType.createSynthesizedInstance('__new__', FunctionTypeFlags.ConstructorMethod);
+    newType.details.constructorTypeVarScopeId = classType.details.typeVarScopeId;
     const initType = FunctionType.createSynthesizedInstance('__init__');
+    initType.details.constructorTypeVarScopeId = classType.details.typeVarScopeId;
 
-    // Override `__new__` because some dataclasses (such as those that are
-    // created by subclassing from NamedTuple) may have their own custom
-    // __new__ that requires overriding.
+    // Generate both a __new__ and an __init__ method. The parameters of the
+    // __new__ method are based on field definitions for NamedTuple classes,
+    // and the parameters of the __init__ method are based on field definitions
+    // in other cases.
     FunctionType.addParameter(newType, {
         category: ParameterCategory.Simple,
         name: 'cls',
         type: classTypeVar,
         hasDeclaredType: true,
     });
-    FunctionType.addDefaultParameters(newType);
+    if (!isNamedTuple) {
+        FunctionType.addDefaultParameters(newType);
+    }
     newType.details.declaredReturnType = convertToInstance(classTypeVar);
 
     const selfParam: FunctionParameter = {
@@ -107,7 +115,10 @@ export function synthesizeDataClassMethods(
         hasDeclaredType: true,
     };
     FunctionType.addParameter(initType, selfParam);
-    initType.details.declaredReturnType = NoneType.createInstance();
+    if (isNamedTuple) {
+        FunctionType.addDefaultParameters(initType);
+    }
+    initType.details.declaredReturnType = evaluator.getNoneType();
 
     // Maintain a list of all dataclass entries (including
     // those from inherited classes) plus a list of only those
@@ -123,366 +134,352 @@ export function synthesizeDataClassMethods(
         FunctionType.addDefaultParameters(initType);
     }
 
+    // Add field-based parameters to either the __new__ or __init__ method
+    // based on whether this is a NamedTuple or a dataclass.
+    const constructorType = isNamedTuple ? newType : initType;
+
     // Maintain a list of "type evaluators".
     type EntryTypeEvaluator = () => Type;
     const localEntryTypeEvaluator: { entry: DataClassEntry; evaluator: EntryTypeEvaluator }[] = [];
     let sawKeywordOnlySeparator = false;
 
-    classType.details.fields.forEach((symbol) => {
-        if (!symbol.isIgnoredForProtocolMatch()) {
-            // Only variables (not functions, classes, etc.) are considered.
-            const classVarDecl = symbol.getTypedDeclarations().find((decl) => {
-                if (decl.type !== DeclarationType.Variable) {
-                    return false;
-                }
+    ClassType.getSymbolTable(classType).forEach((symbol, name) => {
+        if (symbol.isIgnoredForProtocolMatch()) {
+            return;
+        }
 
-                const container = getEnclosingClassOrFunction(decl.node);
-                if (!container || container.nodeType !== ParseNodeType.Class) {
-                    return false;
-                }
+        // Apparently, `__hash__` is special-cased in a dataclass. I can't find
+        // this in the spec, but the runtime seems to treat is specially.
+        if (name === '__hash__') {
+            return;
+        }
 
-                return true;
-            });
+        // Only variables (not functions, classes, etc.) are considered.
+        const classVarDecl = symbol.getTypedDeclarations().find((decl) => {
+            if (decl.type !== DeclarationType.Variable) {
+                return false;
+            }
 
-            if (classVarDecl) {
-                let statement: ParseNode | undefined = classVarDecl.node;
+            const container = getEnclosingClassOrFunction(decl.node);
+            if (!container || container.nodeType !== ParseNodeType.Class) {
+                return false;
+            }
 
-                while (statement) {
-                    if (statement.nodeType === ParseNodeType.Assignment) {
-                        break;
-                    }
+            return true;
+        });
 
-                    if (statement.nodeType === ParseNodeType.TypeAnnotation) {
-                        if (statement.parent?.nodeType === ParseNodeType.Assignment) {
-                            statement = statement.parent;
-                        }
-                        break;
-                    }
+        if (classVarDecl) {
+            let statement: ParseNode | undefined = classVarDecl.node;
 
-                    statement = statement.parent;
-                }
-
-                if (!statement) {
-                    return;
-                }
-
-                let variableNameNode: NameNode | undefined;
-                let aliasName: string | undefined;
-                let variableTypeEvaluator: EntryTypeEvaluator | undefined;
-                let hasDefaultValue = false;
-                let isKeywordOnly = ClassType.isDataClassKeywordOnlyParams(classType) || sawKeywordOnlySeparator;
-                let defaultValueExpression: ExpressionNode | undefined;
-                let includeInInit = true;
-                let converter: ArgumentNode | undefined;
-
+            while (statement) {
                 if (statement.nodeType === ParseNodeType.Assignment) {
-                    if (
-                        statement.leftExpression.nodeType === ParseNodeType.TypeAnnotation &&
-                        statement.leftExpression.valueExpression.nodeType === ParseNodeType.Name
-                    ) {
-                        variableNameNode = statement.leftExpression.valueExpression;
-                        const assignmentStatement = statement;
-                        variableTypeEvaluator = () =>
-                            evaluator.getTypeOfAnnotation(
-                                (assignmentStatement.leftExpression as TypeAnnotationNode).typeAnnotation,
-                                {
-                                    isVariableAnnotation: true,
-                                    allowFinal: true,
-                                    allowClassVar: true,
-                                }
-                            );
+                    break;
+                }
+
+                if (statement.nodeType === ParseNodeType.TypeAnnotation) {
+                    if (statement.parent?.nodeType === ParseNodeType.Assignment) {
+                        statement = statement.parent;
                     }
+                    break;
+                }
 
-                    hasDefaultValue = true;
-                    defaultValueExpression = statement.rightExpression;
+                statement = statement.parent;
+            }
 
-                    // If the RHS of the assignment is assigning a field instance where the
-                    // "init" parameter is set to false, do not include it in the init method.
-                    if (statement.rightExpression.nodeType === ParseNodeType.Call) {
-                        const callTypeResult = evaluator.getTypeOfExpression(
-                            statement.rightExpression.leftExpression,
-                            EvaluatorFlags.DoNotSpecialize
-                        );
-                        const callType = callTypeResult.type;
+            if (!statement) {
+                return;
+            }
 
-                        if (
-                            isDataclassFieldConstructor(
-                                callType,
-                                classType.details.dataClassBehaviors?.fieldDescriptorNames || []
-                            )
-                        ) {
-                            const initArg = statement.rightExpression.arguments.find(
-                                (arg) => arg.name?.value === 'init'
-                            );
-                            if (initArg && initArg.valueExpression) {
-                                const fileInfo = AnalyzerNodeInfo.getFileInfo(node);
-                                const value = evaluateStaticBoolExpression(
-                                    initArg.valueExpression,
-                                    fileInfo.executionEnvironment,
-                                    fileInfo.definedConstants
-                                );
-                                if (value === false) {
-                                    includeInInit = false;
-                                }
-                            } else {
-                                // See if the field constructor has an `init` parameter with
-                                // a default value.
-                                let callTarget: FunctionType | undefined;
-                                if (isFunction(callType)) {
-                                    callTarget = callType;
-                                } else if (isOverloadedFunction(callType)) {
-                                    callTarget = evaluator.getBestOverloadForArguments(
-                                        statement.rightExpression,
-                                        { type: callType, isIncomplete: callTypeResult.isIncomplete },
-                                        statement.rightExpression.arguments
-                                    );
-                                } else if (isInstantiableClass(callType)) {
-                                    const initCall = evaluator.getBoundMethod(callType, '__init__');
-                                    if (initCall) {
-                                        if (isFunction(initCall)) {
-                                            callTarget = initCall;
-                                        } else if (isOverloadedFunction(initCall)) {
-                                            callTarget = evaluator.getBestOverloadForArguments(
-                                                statement.rightExpression,
-                                                { type: initCall },
-                                                statement.rightExpression.arguments
-                                            );
-                                        }
-                                    }
-                                }
+            let variableNameNode: NameNode | undefined;
+            let aliasName: string | undefined;
+            let variableTypeEvaluator: EntryTypeEvaluator | undefined;
+            let hasDefaultValue = false;
+            let isKeywordOnly = ClassType.isDataClassKeywordOnlyParams(classType) || sawKeywordOnlySeparator;
+            let defaultValueExpression: ExpressionNode | undefined;
+            let includeInInit = true;
+            let converter: ArgumentNode | undefined;
 
-                                if (callTarget) {
-                                    const initParam = callTarget.details.parameters.find((p) => p.name === 'init');
-                                    if (initParam && initParam.defaultValueExpression && initParam.hasDeclaredType) {
-                                        if (
-                                            isClass(initParam.type) &&
-                                            ClassType.isBuiltIn(initParam.type, 'bool') &&
-                                            isLiteralType(initParam.type)
-                                        ) {
-                                            if (initParam.type.literalValue === false) {
-                                                includeInInit = false;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            const kwOnlyArg = statement.rightExpression.arguments.find(
-                                (arg) => arg.name?.value === 'kw_only'
-                            );
-                            if (kwOnlyArg && kwOnlyArg.valueExpression) {
-                                const fileInfo = AnalyzerNodeInfo.getFileInfo(node);
-                                const value = evaluateStaticBoolExpression(
-                                    kwOnlyArg.valueExpression,
-                                    fileInfo.executionEnvironment,
-                                    fileInfo.definedConstants
-                                );
-                                if (value === false) {
-                                    isKeywordOnly = false;
-                                } else if (value === true) {
-                                    isKeywordOnly = true;
-                                }
-                            }
-
-                            const defaultArg = statement.rightExpression.arguments.find(
-                                (arg) =>
-                                    arg.name?.value === 'default' ||
-                                    arg.name?.value === 'default_factory' ||
-                                    arg.name?.value === 'factory'
-                            );
-
-                            hasDefaultValue = !!defaultArg;
-                            if (defaultArg?.valueExpression) {
-                                defaultValueExpression = defaultArg.valueExpression;
-                            }
-
-                            const aliasArg = statement.rightExpression.arguments.find(
-                                (arg) => arg.name?.value === 'alias'
-                            );
-                            if (aliasArg) {
-                                const valueType = evaluator.getTypeOfExpression(aliasArg.valueExpression).type;
-                                if (
-                                    isClassInstance(valueType) &&
-                                    ClassType.isBuiltIn(valueType, 'str') &&
-                                    isLiteralType(valueType)
-                                ) {
-                                    aliasName = valueType.literalValue as string;
-                                }
-                            }
-
-                            const converterArg = statement.rightExpression.arguments.find(
-                                (arg) => arg.name?.value === 'converter'
-                            );
-                            if (converterArg && converterArg.valueExpression) {
-                                converter = converterArg;
-                            }
-                        }
-                    }
-                } else if (statement.nodeType === ParseNodeType.TypeAnnotation) {
-                    if (statement.valueExpression.nodeType === ParseNodeType.Name) {
-                        variableNameNode = statement.valueExpression;
-                        const annotationStatement = statement;
-                        variableTypeEvaluator = () =>
-                            evaluator.getTypeOfAnnotation(annotationStatement.typeAnnotation, {
+            if (statement.nodeType === ParseNodeType.Assignment) {
+                if (
+                    statement.leftExpression.nodeType === ParseNodeType.TypeAnnotation &&
+                    statement.leftExpression.valueExpression.nodeType === ParseNodeType.Name
+                ) {
+                    variableNameNode = statement.leftExpression.valueExpression;
+                    const assignmentStatement = statement;
+                    variableTypeEvaluator = () =>
+                        evaluator.getTypeOfAnnotation(
+                            (assignmentStatement.leftExpression as TypeAnnotationNode).typeAnnotation,
+                            {
                                 isVariableAnnotation: true,
                                 allowFinal: true,
                                 allowClassVar: true,
-                            });
-
-                        // Is this a KW_ONLY separator introduced in Python 3.10?
-                        if (statement.valueExpression.value === '_') {
-                            const annotatedType = variableTypeEvaluator();
-
-                            if (isClassInstance(annotatedType) && ClassType.isBuiltIn(annotatedType, 'KW_ONLY')) {
-                                sawKeywordOnlySeparator = true;
-                                variableNameNode = undefined;
-                                variableTypeEvaluator = undefined;
                             }
-                        }
-                    }
+                        );
                 }
 
-                if (variableNameNode && variableTypeEvaluator) {
-                    const variableName = variableNameNode.value;
-
-                    // Don't include class vars. PEP 557 indicates that they shouldn't
-                    // be considered data class entries.
-                    const variableSymbol = classType.details.fields.get(variableName);
-                    const isFinal = variableSymbol
-                        ?.getDeclarations()
-                        .some((decl) => decl.type === DeclarationType.Variable && decl.isFinal);
-
-                    if (variableSymbol?.isClassVar() && !isFinal) {
-                        // If an ancestor class declared an instance variable but this dataclass
-                        // declares a ClassVar, delete the older one from the full data class entries.
-                        // We exclude final variables here because a Final type annotation is implicitly
-                        // considered a ClassVar by the binder, but dataclass rules are different.
-                        const index = fullDataClassEntries.findIndex((p) => p.name === variableName);
-                        if (index >= 0) {
-                            fullDataClassEntries.splice(index, 1);
-                        }
-                        const dataClassEntry: DataClassEntry = {
-                            name: variableName,
-                            classType,
-                            alias: aliasName,
-                            isKeywordOnly: false,
-                            hasDefault: hasDefaultValue,
-                            defaultValueExpression,
-                            includeInInit,
-                            nameNode: variableNameNode,
-                            type: UnknownType.create(),
-                            isClassVar: true,
-                            converter,
-                        };
-                        localDataClassEntries.push(dataClassEntry);
-                    } else {
-                        // Create a new data class entry, but defer evaluation of the type until
-                        // we've compiled the full list of data class entries for this class. This
-                        // allows us to handle circular references in types.
-                        const dataClassEntry: DataClassEntry = {
-                            name: variableName,
-                            classType,
-                            alias: aliasName,
-                            isKeywordOnly,
-                            hasDefault: hasDefaultValue,
-                            defaultValueExpression,
-                            includeInInit,
-                            nameNode: variableNameNode,
-                            type: UnknownType.create(),
-                            isClassVar: false,
-                            converter,
-                        };
-                        localEntryTypeEvaluator.push({ entry: dataClassEntry, evaluator: variableTypeEvaluator });
-
-                        // Add the new entry to the local entry list.
-                        let insertIndex = localDataClassEntries.findIndex((e) => e.name === variableName);
-                        if (insertIndex >= 0) {
-                            localDataClassEntries[insertIndex] = dataClassEntry;
-                        } else {
-                            localDataClassEntries.push(dataClassEntry);
-                        }
-
-                        // Add the new entry to the full entry list.
-                        insertIndex = fullDataClassEntries.findIndex((p) => p.name === variableName);
-                        if (insertIndex >= 0) {
-                            const oldEntry = fullDataClassEntries[insertIndex];
-
-                            // While this isn't documented behavior, it appears that the dataclass implementation
-                            // causes overridden variables to "inherit" default values from parent classes.
-                            if (!dataClassEntry.hasDefault && oldEntry.hasDefault && oldEntry.includeInInit) {
-                                dataClassEntry.hasDefault = true;
-                                dataClassEntry.defaultValueExpression = oldEntry.defaultValueExpression;
-                                hasDefaultValue = true;
-                            }
-
-                            fullDataClassEntries[insertIndex] = dataClassEntry;
-                        } else {
-                            fullDataClassEntries.push(dataClassEntry);
-                            insertIndex = fullDataClassEntries.length - 1;
-                        }
-
-                        // If we've already seen a entry with a default value defined,
-                        // all subsequent entries must also have default values.
-                        if (!isKeywordOnly && includeInInit && !skipSynthesizeInit && !hasDefaultValue) {
-                            const firstDefaultValueIndex = fullDataClassEntries.findIndex(
-                                (p) => p.hasDefault && p.includeInInit && !p.isKeywordOnly
-                            );
-                            if (firstDefaultValueIndex >= 0 && firstDefaultValueIndex < insertIndex) {
-                                evaluator.addDiagnostic(
-                                    AnalyzerNodeInfo.getFileInfo(node).diagnosticRuleSet.reportGeneralTypeIssues,
-                                    DiagnosticRule.reportGeneralTypeIssues,
-                                    Localizer.Diagnostic.dataClassFieldWithDefault(),
-                                    variableNameNode
-                                );
-                            }
-                        }
-                    }
-                }
-            } else {
-                // The symbol had no declared type, so it is (mostly) ignored by dataclasses.
-                // However, if it is assigned a field descriptor, it will result in a
-                // runtime exception.
-                const declarations = symbol.getDeclarations();
-                if (declarations.length === 0) {
-                    return;
-                }
-                const lastDecl = declarations[declarations.length - 1];
-                if (lastDecl.type !== DeclarationType.Variable) {
-                    return;
-                }
-
-                const statement = lastDecl.node.parent;
-                if (!statement || statement.nodeType !== ParseNodeType.Assignment) {
-                    return;
-                }
+                hasDefaultValue = true;
+                defaultValueExpression = statement.rightExpression;
 
                 // If the RHS of the assignment is assigning a field instance where the
                 // "init" parameter is set to false, do not include it in the init method.
                 if (statement.rightExpression.nodeType === ParseNodeType.Call) {
-                    const callType = evaluator.getTypeOfExpression(
+                    const callTypeResult = evaluator.getTypeOfExpression(
                         statement.rightExpression.leftExpression,
-                        EvaluatorFlags.DoNotSpecialize
-                    ).type;
+                        EvaluatorFlags.CallBaseDefaults
+                    );
+                    const callType = callTypeResult.type;
 
                     if (
+                        !isNamedTuple &&
                         isDataclassFieldConstructor(
                             callType,
                             classType.details.dataClassBehaviors?.fieldDescriptorNames || []
                         )
                     ) {
-                        evaluator.addDiagnostic(
-                            AnalyzerNodeInfo.getFileInfo(node).diagnosticRuleSet.reportGeneralTypeIssues,
-                            DiagnosticRule.reportGeneralTypeIssues,
-                            Localizer.Diagnostic.dataClassFieldWithoutAnnotation(),
-                            statement.rightExpression
+                        const initArg = statement.rightExpression.arguments.find((arg) => arg.name?.value === 'init');
+                        if (initArg && initArg.valueExpression) {
+                            const fileInfo = AnalyzerNodeInfo.getFileInfo(node);
+                            includeInInit =
+                                evaluateStaticBoolExpression(
+                                    initArg.valueExpression,
+                                    fileInfo.executionEnvironment,
+                                    fileInfo.definedConstants
+                                ) ?? includeInInit;
+                        } else {
+                            includeInInit =
+                                getDefaultArgValueForFieldSpecifier(
+                                    evaluator,
+                                    statement.rightExpression,
+                                    callTypeResult,
+                                    'init'
+                                ) ?? includeInInit;
+                        }
+
+                        const kwOnlyArg = statement.rightExpression.arguments.find(
+                            (arg) => arg.name?.value === 'kw_only'
                         );
+                        if (kwOnlyArg && kwOnlyArg.valueExpression) {
+                            const fileInfo = AnalyzerNodeInfo.getFileInfo(node);
+                            isKeywordOnly =
+                                evaluateStaticBoolExpression(
+                                    kwOnlyArg.valueExpression,
+                                    fileInfo.executionEnvironment,
+                                    fileInfo.definedConstants
+                                ) ?? isKeywordOnly;
+                        } else {
+                            isKeywordOnly =
+                                getDefaultArgValueForFieldSpecifier(
+                                    evaluator,
+                                    statement.rightExpression,
+                                    callTypeResult,
+                                    'kw_only'
+                                ) ?? isKeywordOnly;
+                        }
+
+                        const defaultArg = statement.rightExpression.arguments.find(
+                            (arg) =>
+                                arg.name?.value === 'default' ||
+                                arg.name?.value === 'default_factory' ||
+                                arg.name?.value === 'factory'
+                        );
+
+                        hasDefaultValue = !!defaultArg;
+                        if (defaultArg?.valueExpression) {
+                            defaultValueExpression = defaultArg.valueExpression;
+                        }
+
+                        const aliasArg = statement.rightExpression.arguments.find((arg) => arg.name?.value === 'alias');
+                        if (aliasArg) {
+                            const valueType = evaluator.getTypeOfExpression(aliasArg.valueExpression).type;
+                            if (
+                                isClassInstance(valueType) &&
+                                ClassType.isBuiltIn(valueType, 'str') &&
+                                isLiteralType(valueType)
+                            ) {
+                                aliasName = valueType.literalValue as string;
+                            }
+                        }
+
+                        const converterArg = statement.rightExpression.arguments.find(
+                            (arg) => arg.name?.value === 'converter'
+                        );
+                        if (converterArg && converterArg.valueExpression) {
+                            // Converter support is dependent on PEP 712, which has not yet been approved.
+                            if (AnalyzerNodeInfo.getFileInfo(node).diagnosticRuleSet.enableExperimentalFeatures) {
+                                converter = converterArg;
+                            }
+                        }
                     }
+                }
+            } else if (statement.nodeType === ParseNodeType.TypeAnnotation) {
+                if (statement.valueExpression.nodeType === ParseNodeType.Name) {
+                    variableNameNode = statement.valueExpression;
+                    const annotationStatement = statement;
+                    variableTypeEvaluator = () =>
+                        evaluator.getTypeOfAnnotation(annotationStatement.typeAnnotation, {
+                            isVariableAnnotation: true,
+                            allowFinal: true,
+                            allowClassVar: true,
+                        });
+
+                    // Is this a KW_ONLY separator introduced in Python 3.10?
+                    if (!isNamedTuple && statement.valueExpression.value === '_') {
+                        const annotatedType = variableTypeEvaluator();
+
+                        if (isClassInstance(annotatedType) && ClassType.isBuiltIn(annotatedType, 'KW_ONLY')) {
+                            sawKeywordOnlySeparator = true;
+                            variableNameNode = undefined;
+                            variableTypeEvaluator = undefined;
+                        }
+                    }
+                }
+            }
+
+            if (variableNameNode && variableTypeEvaluator) {
+                const variableName = variableNameNode.value;
+
+                // Don't include class vars. PEP 557 indicates that they shouldn't
+                // be considered data class entries.
+                const variableSymbol = ClassType.getSymbolTable(classType).get(variableName);
+
+                if (variableSymbol?.isClassVar() && !variableSymbol?.isFinalVarInClassBody()) {
+                    // If an ancestor class declared an instance variable but this dataclass
+                    // declares a ClassVar, delete the older one from the full data class entries.
+                    // We exclude final variables here because a Final type annotation is implicitly
+                    // considered a ClassVar by the binder, but dataclass rules are different.
+                    const index = fullDataClassEntries.findIndex((p) => p.name === variableName);
+                    if (index >= 0) {
+                        fullDataClassEntries.splice(index, 1);
+                    }
+                    const dataClassEntry: DataClassEntry = {
+                        name: variableName,
+                        classType,
+                        alias: aliasName,
+                        isKeywordOnly: false,
+                        hasDefault: hasDefaultValue,
+                        defaultValueExpression,
+                        includeInInit,
+                        nameNode: variableNameNode,
+                        type: UnknownType.create(),
+                        isClassVar: true,
+                        converter,
+                    };
+                    localDataClassEntries.push(dataClassEntry);
+                } else {
+                    // Create a new data class entry, but defer evaluation of the type until
+                    // we've compiled the full list of data class entries for this class. This
+                    // allows us to handle circular references in types.
+                    const dataClassEntry: DataClassEntry = {
+                        name: variableName,
+                        classType,
+                        alias: aliasName,
+                        isKeywordOnly,
+                        hasDefault: hasDefaultValue,
+                        defaultValueExpression,
+                        includeInInit,
+                        nameNode: variableNameNode,
+                        type: UnknownType.create(),
+                        isClassVar: false,
+                        converter,
+                    };
+                    localEntryTypeEvaluator.push({ entry: dataClassEntry, evaluator: variableTypeEvaluator });
+
+                    // Add the new entry to the local entry list.
+                    let insertIndex = localDataClassEntries.findIndex((e) => e.name === variableName);
+                    if (insertIndex >= 0) {
+                        localDataClassEntries[insertIndex] = dataClassEntry;
+                    } else {
+                        localDataClassEntries.push(dataClassEntry);
+                    }
+
+                    // Add the new entry to the full entry list.
+                    insertIndex = fullDataClassEntries.findIndex((p) => p.name === variableName);
+                    if (insertIndex >= 0) {
+                        const oldEntry = fullDataClassEntries[insertIndex];
+
+                        // While this isn't documented behavior, it appears that the dataclass implementation
+                        // causes overridden variables to "inherit" default values from parent classes.
+                        if (!dataClassEntry.hasDefault && oldEntry.hasDefault && oldEntry.includeInInit) {
+                            dataClassEntry.hasDefault = true;
+                            dataClassEntry.defaultValueExpression = oldEntry.defaultValueExpression;
+                            hasDefaultValue = true;
+
+                            // Warn the user of this case because it can result in type errors if the
+                            // default value is incompatible with the new type.
+                            evaluator.addDiagnostic(
+                                DiagnosticRule.reportGeneralTypeIssues,
+                                LocMessage.dataClassFieldInheritedDefault().format({ fieldName: variableName }),
+                                variableNameNode
+                            );
+                        }
+
+                        fullDataClassEntries[insertIndex] = dataClassEntry;
+                    } else {
+                        fullDataClassEntries.push(dataClassEntry);
+                        insertIndex = fullDataClassEntries.length - 1;
+                    }
+
+                    // If we've already seen a entry with a default value defined,
+                    // all subsequent entries must also have default values.
+                    if (!isKeywordOnly && includeInInit && !skipSynthesizeInit && !hasDefaultValue) {
+                        const firstDefaultValueIndex = fullDataClassEntries.findIndex(
+                            (p) => p.hasDefault && p.includeInInit && !p.isKeywordOnly
+                        );
+                        if (firstDefaultValueIndex >= 0 && firstDefaultValueIndex < insertIndex) {
+                            evaluator.addDiagnostic(
+                                DiagnosticRule.reportGeneralTypeIssues,
+                                LocMessage.dataClassFieldWithDefault(),
+                                variableNameNode
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            // The symbol had no declared type, so it is (mostly) ignored by dataclasses.
+            // However, if it is assigned a field descriptor, it will result in a
+            // runtime exception.
+            const declarations = symbol.getDeclarations();
+            if (declarations.length === 0) {
+                return;
+            }
+            const lastDecl = declarations[declarations.length - 1];
+            if (lastDecl.type !== DeclarationType.Variable) {
+                return;
+            }
+
+            const statement = lastDecl.node.parent;
+            if (!statement || statement.nodeType !== ParseNodeType.Assignment) {
+                return;
+            }
+
+            // If the RHS of the assignment is assigning a field instance where the
+            // "init" parameter is set to false, do not include it in the init method.
+            if (statement.rightExpression.nodeType === ParseNodeType.Call) {
+                const callType = evaluator.getTypeOfExpression(
+                    statement.rightExpression.leftExpression,
+                    EvaluatorFlags.CallBaseDefaults
+                ).type;
+
+                if (
+                    isDataclassFieldConstructor(
+                        callType,
+                        classType.details.dataClassBehaviors?.fieldDescriptorNames || []
+                    )
+                ) {
+                    evaluator.addDiagnostic(
+                        DiagnosticRule.reportGeneralTypeIssues,
+                        LocMessage.dataClassFieldWithoutAnnotation(),
+                        statement.rightExpression
+                    );
                 }
             }
         }
     });
 
-    classType.details.dataClassEntries = localDataClassEntries;
+    if (!isNamedTuple) {
+        classType.details.dataClassEntries = localDataClassEntries;
+    }
 
     // Now that the dataClassEntries field has been set with a complete list
     // of local data class entries for this class, perform deferred type
@@ -493,7 +490,7 @@ export function synthesizeDataClassMethods(
         entryEvaluator.entry.type = entryEvaluator.evaluator();
     });
 
-    const symbolTable = classType.details.fields;
+    const symbolTable = ClassType.getSymbolTable(classType);
     const keywordOnlyParams: FunctionParameter[] = [];
 
     if (!skipSynthesizeInit && !hasExistingInitMethod) {
@@ -532,7 +529,11 @@ export function synthesizeDataClassMethods(
                     const effectiveName = entry.alias || entry.name;
 
                     if (!entry.alias && entry.nameNode && isPrivateName(entry.nameNode.value)) {
-                        evaluator.addError(Localizer.Diagnostic.dataClassFieldWithPrivateName(), entry.nameNode);
+                        evaluator.addDiagnostic(
+                            DiagnosticRule.reportGeneralTypeIssues,
+                            LocMessage.dataClassFieldWithPrivateName(),
+                            entry.nameNode
+                        );
                     }
 
                     const functionParam: FunctionParameter = {
@@ -547,18 +548,15 @@ export function synthesizeDataClassMethods(
                     if (entry.isKeywordOnly) {
                         keywordOnlyParams.push(functionParam);
                     } else {
-                        FunctionType.addParameter(initType, functionParam);
+                        FunctionType.addParameter(constructorType, functionParam);
                     }
                 }
             });
 
             if (keywordOnlyParams.length > 0) {
-                FunctionType.addParameter(initType, {
-                    category: ParameterCategory.ArgsList,
-                    type: AnyType.create(),
-                });
+                FunctionType.addKeywordOnlyParameterSeparator(constructorType);
                 keywordOnlyParams.forEach((param) => {
-                    FunctionType.addParameter(initType, param);
+                    FunctionType.addParameter(constructorType, param);
                 });
             }
         }
@@ -619,8 +617,7 @@ export function synthesizeDataClassMethods(
         });
     }
 
-    let synthesizeHashFunction =
-        !ClassType.isSkipSynthesizedDataClassEq(classType) && ClassType.isFrozenDataClass(classType);
+    let synthesizeHashFunction = ClassType.isFrozenDataClass(classType);
     const synthesizeHashNone =
         !ClassType.isSkipSynthesizedDataClassEq(classType) && !ClassType.isFrozenDataClass(classType);
 
@@ -647,7 +644,7 @@ export function synthesizeDataClassMethods(
             '__hash__',
             Symbol.createWithType(
                 SymbolFlags.ClassMember | SymbolFlags.IgnoredForOverrideChecks,
-                NoneType.createInstance()
+                evaluator.getNoneType()
             )
         );
     }
@@ -705,6 +702,69 @@ export function synthesizeDataClassMethods(
     }
 }
 
+// If a field specifier is used to define a field, it may define a default
+// argument value (either True or False) for a supported keyword parameter.
+// This function extracts that default value if present and returns it. If
+// it's not present, it returns undefined.
+function getDefaultArgValueForFieldSpecifier(
+    evaluator: TypeEvaluator,
+    callNode: CallNode,
+    callTypeResult: TypeResult,
+    paramName: string
+): boolean | undefined {
+    const callType = callTypeResult.type;
+    let callTarget: FunctionType | undefined;
+
+    if (isFunction(callType)) {
+        callTarget = callType;
+    } else if (isOverloadedFunction(callType)) {
+        callTarget = evaluator.getBestOverloadForArguments(
+            callNode,
+            { type: callType, isIncomplete: callTypeResult.isIncomplete },
+            callNode.arguments
+        );
+    } else if (isInstantiableClass(callType)) {
+        const initMethodResult = getBoundInitMethod(evaluator, callNode, callType);
+        if (initMethodResult) {
+            if (isFunction(initMethodResult.type)) {
+                callTarget = initMethodResult.type;
+            } else if (isOverloadedFunction(initMethodResult.type)) {
+                callTarget = evaluator.getBestOverloadForArguments(
+                    callNode,
+                    { type: initMethodResult.type },
+                    callNode.arguments
+                );
+            }
+        }
+    }
+
+    if (callTarget) {
+        const initParam = callTarget.details.parameters.find((p) => p.name === paramName);
+        if (initParam) {
+            // Is the parameter type a literal bool?
+            if (
+                initParam.hasDeclaredType &&
+                isClass(initParam.type) &&
+                typeof initParam.type.literalValue === 'boolean'
+            ) {
+                return initParam.type.literalValue;
+            }
+
+            // Is the default argument value a literal bool?
+            if (
+                initParam.defaultValueExpression &&
+                initParam.defaultType &&
+                isClass(initParam.defaultType) &&
+                typeof initParam.defaultType.literalValue === 'boolean'
+            ) {
+                return initParam.defaultType.literalValue;
+            }
+        }
+    }
+
+    return undefined;
+}
+
 // Validates converter and, if valid, returns its input type. If invalid,
 // fieldType is returned.
 function getConverterInputType(
@@ -735,41 +795,30 @@ function getConverterInputType(
         type: typeVar,
         hasDeclaredType: true,
     });
-    FunctionType.addParameter(targetFunction, {
-        category: ParameterCategory.Simple,
-        name: '',
-        type: UnknownType.create(),
-    });
+    FunctionType.addPositionOnlyParameterSeparator(targetFunction);
 
-    if (isFunction(converterType)) {
-        const typeVarContext = new TypeVarContext(typeVar.scopeId);
-        const diagAddendum = new DiagnosticAddendum();
-
-        if (evaluator.assignType(targetFunction, converterType, diagAddendum, typeVarContext)) {
-            const solution = applySolvedTypeVars(typeVar, typeVarContext, { unknownIfNotFound: true });
-            return solution;
-        }
-
-        evaluator.addDiagnostic(
-            AnalyzerNodeInfo.getFileInfo(converterNode).diagnosticRuleSet.reportGeneralTypeIssues,
-            DiagnosticRule.reportGeneralTypeIssues,
-            Localizer.Diagnostic.dataClassConverterFunction().format({
-                argType: evaluator.printType(converterType),
-                fieldType: evaluator.printType(fieldType),
-                fieldName: fieldName,
-            }) + diagAddendum.getString(),
-            converterNode,
-            diagAddendum.getEffectiveTextRange() ?? converterNode
-        );
-    } else {
+    if (isFunction(converterType) || isOverloadedFunction(converterType)) {
         const acceptedTypes: Type[] = [];
         const diagAddendum = new DiagnosticAddendum();
 
-        OverloadedFunctionType.getOverloads(converterType).forEach((overload) => {
-            const typeVarContext = new TypeVarContext(typeVar.scopeId);
+        doForEachSignature(converterType, (signature) => {
+            const returnTypeVarContext = new TypeVarContext(getTypeVarScopeIds(signature));
 
-            if (evaluator.assignType(targetFunction, overload, diagAddendum, typeVarContext)) {
-                const overloadSolution = applySolvedTypeVars(typeVar, typeVarContext, { unknownIfNotFound: true });
+            if (
+                evaluator.assignType(
+                    FunctionType.getEffectiveReturnType(signature) ?? UnknownType.create(),
+                    fieldType,
+                    /* diag */ undefined,
+                    returnTypeVarContext
+                )
+            ) {
+                signature = applySolvedTypeVars(signature, returnTypeVarContext) as FunctionType;
+            }
+
+            const inputTypeVarContext = new TypeVarContext(typeVar.scopeId);
+
+            if (evaluator.assignType(targetFunction, signature, diagAddendum, inputTypeVarContext)) {
+                const overloadSolution = applySolvedTypeVars(typeVar, inputTypeVarContext, { unknownIfNotFound: true });
                 acceptedTypes.push(overloadSolution);
             }
         });
@@ -778,16 +827,28 @@ function getConverterInputType(
             return combineTypes(acceptedTypes);
         }
 
-        evaluator.addDiagnostic(
-            AnalyzerNodeInfo.getFileInfo(converterNode).diagnosticRuleSet.reportGeneralTypeIssues,
-            DiagnosticRule.reportGeneralTypeIssues,
-            Localizer.Diagnostic.dataClassConverterOverloads().format({
-                funcName: converterType.overloads[0].details.name || '<anonymous function>',
-                fieldType: evaluator.printType(fieldType),
-                fieldName: fieldName,
-            }) + diagAddendum.getString(),
-            converterNode
-        );
+        if (isFunction(converterType)) {
+            evaluator.addDiagnostic(
+                DiagnosticRule.reportGeneralTypeIssues,
+                LocMessage.dataClassConverterFunction().format({
+                    argType: evaluator.printType(converterType),
+                    fieldType: evaluator.printType(fieldType),
+                    fieldName: fieldName,
+                }) + diagAddendum.getString(),
+                converterNode,
+                diagAddendum.getEffectiveTextRange() ?? converterNode
+            );
+        } else {
+            evaluator.addDiagnostic(
+                DiagnosticRule.reportGeneralTypeIssues,
+                LocMessage.dataClassConverterOverloads().format({
+                    funcName: converterType.overloads[0].details.name || '<anonymous function>',
+                    fieldType: evaluator.printType(fieldType),
+                    fieldName: fieldName,
+                }) + diagAddendum.getString(),
+                converterNode
+            );
+        }
     }
 
     return fieldType;
@@ -802,11 +863,23 @@ function getConverterAsFunction(
     }
 
     if (isClassInstance(converterType)) {
-        return evaluator.getBoundMethod(converterType, '__call__');
+        return evaluator.getBoundMagicMethod(converterType, '__call__');
     }
 
     if (isInstantiableClass(converterType)) {
-        return createFunctionFromConstructor(evaluator, converterType);
+        let fromConstructor = createFunctionFromConstructor(evaluator, converterType);
+        if (fromConstructor) {
+            // If conversion to a constructor resulted in a union type, we'll
+            // choose the first of the two subtypes, which typically corresponds
+            // to the __init__ method (rather than the __new__ method).
+            if (isUnion(fromConstructor)) {
+                fromConstructor = fromConstructor.subtypes[0];
+            }
+
+            if (isFunction(fromConstructor) || isOverloadedFunction(fromConstructor)) {
+                return fromConstructor;
+            }
+        }
     }
 
     return undefined;
@@ -833,7 +906,7 @@ function getDescriptorForConverterField(
         descriptorName,
         getClassFullName(converterNode, fileInfo.moduleName, descriptorName),
         fileInfo.moduleName,
-        fileInfo.filePath,
+        fileInfo.fileUri,
         ClassTypeFlags.None,
         getTypeSourceId(converterNode),
         /* declaredMetaclass */ undefined,
@@ -842,7 +915,7 @@ function getDescriptorForConverterField(
     descriptorClass.details.baseClasses.push(evaluator.getBuiltInType(dataclassNode, 'object'));
     computeMroLinearization(descriptorClass);
 
-    const fields = descriptorClass.details.fields;
+    const fields = ClassType.getSymbolTable(descriptorClass);
     const selfType = synthesizeTypeVarForSelfCls(descriptorClass, /* isClsParam */ false);
 
     const setFunction = FunctionType.createSynthesizedInstance('__set__');
@@ -864,7 +937,7 @@ function getDescriptorForConverterField(
         type: setType,
         hasDeclaredType: true,
     });
-    setFunction.details.declaredReturnType = NoneType.createInstance();
+    setFunction.details.declaredReturnType = evaluator.getNoneType();
     const setSymbol = Symbol.createWithType(SymbolFlags.ClassMember, setFunction);
     fields.set('__set__', setSymbol);
 
@@ -898,27 +971,21 @@ function getDescriptorForConverterField(
 // __set__ method, this method transforms the type into the input parameter
 // for the set method.
 function transformDescriptorType(evaluator: TypeEvaluator, type: Type): Type {
-    if (!isClassInstance(type)) {
+    if (!isClassInstance(type) || isMetaclassInstance(type)) {
         return type;
     }
 
-    const setMethodInfo = lookUpObjectMember(type, '__set__');
-    if (!setMethodInfo) {
+    const setMethodType = evaluator.getBoundMagicMethod(type, '__set__');
+    if (!setMethodType) {
         return type;
     }
 
-    const setMethodType = evaluator.getTypeOfMember(setMethodInfo);
     if (!isFunction(setMethodType)) {
         return type;
     }
 
-    const boundSetMethod = evaluator.bindFunctionToClassOrObject(type, setMethodType);
-    if (!boundSetMethod || !isFunction(boundSetMethod) || boundSetMethod.details.parameters.length < 2) {
-        return type;
-    }
-
     // The value parameter for a bound __set__ method is parameter index 1.
-    return FunctionType.getEffectiveParameterType(boundSetMethod, 1);
+    return FunctionType.getEffectiveParameterType(setMethodType, 1);
 }
 
 // Builds a sorted list of dataclass entries that are inherited by
@@ -998,7 +1065,11 @@ export function validateDataClassTransformDecorator(
     // Parse the arguments to the call.
     node.arguments.forEach((arg) => {
         if (!arg.name || arg.argumentCategory !== ArgumentCategory.Simple) {
-            evaluator.addError(Localizer.Diagnostic.dataClassTransformPositionalParam(), arg);
+            evaluator.addDiagnostic(
+                DiagnosticRule.reportCallIssue,
+                LocMessage.dataClassTransformPositionalParam(),
+                arg
+            );
             return;
         }
 
@@ -1010,8 +1081,9 @@ export function validateDataClassTransformDecorator(
                     fileInfo.definedConstants
                 );
                 if (value === undefined) {
-                    evaluator.addError(
-                        Localizer.Diagnostic.dataClassTransformExpectedBoolLiteral(),
+                    evaluator.addDiagnostic(
+                        DiagnosticRule.reportGeneralTypeIssues,
+                        LocMessage.dataClassTransformExpectedBoolLiteral(),
                         arg.valueExpression
                     );
                     return;
@@ -1028,8 +1100,9 @@ export function validateDataClassTransformDecorator(
                     fileInfo.definedConstants
                 );
                 if (value === undefined) {
-                    evaluator.addError(
-                        Localizer.Diagnostic.dataClassTransformExpectedBoolLiteral(),
+                    evaluator.addDiagnostic(
+                        DiagnosticRule.reportGeneralTypeIssues,
+                        LocMessage.dataClassTransformExpectedBoolLiteral(),
                         arg.valueExpression
                     );
                     return;
@@ -1046,8 +1119,9 @@ export function validateDataClassTransformDecorator(
                     fileInfo.definedConstants
                 );
                 if (value === undefined) {
-                    evaluator.addError(
-                        Localizer.Diagnostic.dataClassTransformExpectedBoolLiteral(),
+                    evaluator.addDiagnostic(
+                        DiagnosticRule.reportGeneralTypeIssues,
+                        LocMessage.dataClassTransformExpectedBoolLiteral(),
                         arg.valueExpression
                     );
                     return;
@@ -1064,8 +1138,9 @@ export function validateDataClassTransformDecorator(
                     fileInfo.definedConstants
                 );
                 if (value === undefined) {
-                    evaluator.addError(
-                        Localizer.Diagnostic.dataClassTransformExpectedBoolLiteral(),
+                    evaluator.addDiagnostic(
+                        DiagnosticRule.reportGeneralTypeIssues,
+                        LocMessage.dataClassTransformExpectedBoolLiteral(),
                         arg.valueExpression
                     );
                     return;
@@ -1093,8 +1168,9 @@ export function validateDataClassTransformDecorator(
                             !isOverloadedFunction(entry.type)
                     )
                 ) {
-                    evaluator.addError(
-                        Localizer.Diagnostic.dataClassTransformFieldSpecifier().format({
+                    evaluator.addDiagnostic(
+                        DiagnosticRule.reportGeneralTypeIssues,
+                        LocMessage.dataClassTransformFieldSpecifier().format({
                             type: evaluator.printType(valueType),
                         }),
                         arg.valueExpression
@@ -1116,8 +1192,9 @@ export function validateDataClassTransformDecorator(
             }
 
             default:
-                evaluator.addError(
-                    Localizer.Diagnostic.dataClassTransformUnknownArgument().format({ name: arg.name.value }),
+                evaluator.addDiagnostic(
+                    DiagnosticRule.reportGeneralTypeIssues,
+                    LocMessage.dataClassTransformUnknownArgument().format({ name: arg.name.value }),
                     arg.valueExpression
                 );
                 break;
@@ -1232,9 +1309,8 @@ function applyDataClassBehaviorOverrideValue(
                 // A frozen dataclass cannot derive from a non-frozen dataclass.
                 if (hasUnfrozenBaseClass) {
                     evaluator.addDiagnostic(
-                        AnalyzerNodeInfo.getFileInfo(errorNode).diagnosticRuleSet.reportGeneralTypeIssues,
                         DiagnosticRule.reportGeneralTypeIssues,
-                        Localizer.Diagnostic.dataClassBaseClassNotFrozen(),
+                        LocMessage.dataClassBaseClassNotFrozen(),
                         errorNode
                     );
                 }
@@ -1242,9 +1318,8 @@ function applyDataClassBehaviorOverrideValue(
                 // A non-frozen dataclass cannot derive from a frozen dataclass.
                 if (hasFrozenBaseClass) {
                     evaluator.addDiagnostic(
-                        AnalyzerNodeInfo.getFileInfo(errorNode).diagnosticRuleSet.reportGeneralTypeIssues,
                         DiagnosticRule.reportGeneralTypeIssues,
-                        Localizer.Diagnostic.dataClassBaseClassFrozen(),
+                        LocMessage.dataClassBaseClassFrozen(),
                         errorNode
                     );
                 }
@@ -1274,9 +1349,8 @@ function applyDataClassBehaviorOverrideValue(
 
                 if (classType.details.localSlotsNames) {
                     evaluator.addDiagnostic(
-                        AnalyzerNodeInfo.getFileInfo(errorNode).diagnosticRuleSet.reportGeneralTypeIssues,
                         DiagnosticRule.reportGeneralTypeIssues,
-                        Localizer.Diagnostic.dataClassSlotsOverwrite(),
+                        LocMessage.dataClassSlotsOverwrite(),
                         errorNode
                     );
                 }

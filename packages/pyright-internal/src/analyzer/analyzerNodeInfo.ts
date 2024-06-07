@@ -12,12 +12,11 @@
 
 import {
     ClassNode,
+    ComprehensionNode,
     ExecutionScopeNode,
     FunctionNode,
     LambdaNode,
-    ListComprehensionNode,
     ModuleNode,
-    NameNode,
     ParseNode,
     ParseNodeType,
     StringNode,
@@ -77,7 +76,7 @@ interface AnalyzerNodeInfo {
     typeParameterSymbol?: Symbol;
 }
 
-export type ScopedNode = ModuleNode | ClassNode | FunctionNode | LambdaNode | ListComprehensionNode;
+export type ScopedNode = ModuleNode | ClassNode | FunctionNode | LambdaNode | ComprehensionNode;
 
 // Cleans out all fields that are added by the analyzer phases
 // (after the post-parse walker).
@@ -185,16 +184,6 @@ export function getDunderAllInfo(node: ModuleNode): DunderAllInfo | undefined {
 export function setDunderAllInfo(node: ModuleNode, names: DunderAllInfo | undefined) {
     const analyzerNode = node as AnalyzerNodeInfo;
     analyzerNode.dunderAllInfo = names;
-}
-
-export function getTypeParameterSymbol(node: NameNode) {
-    const analyzerNode = node as AnalyzerNodeInfo;
-    return analyzerNode.typeParameterSymbol;
-}
-
-export function setTypeParameterSymbol(node: NameNode, symbol: Symbol) {
-    const analyzerNode = node as AnalyzerNodeInfo;
-    analyzerNode.typeParameterSymbol = symbol;
 }
 
 export function isCodeUnreachable(node: ParseNode): boolean {

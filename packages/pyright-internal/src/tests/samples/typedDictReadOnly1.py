@@ -1,8 +1,10 @@
 # This sample tests error conditions for TypedDict classes with
 # read-only entries as introduced in PEP 705.
 
+# pyright: reportIncompatibleVariableOverride=true
+
 from typing import NotRequired, Required, TypedDict
-from typing_extensions import ReadOnly
+from typing_extensions import ReadOnly  # pyright: ignore[reportMissingModuleSource]
 
 
 class TD1(TypedDict):
@@ -14,25 +16,31 @@ class TD1(TypedDict):
     d: ReadOnly[ReadOnly[str]]
 
 
-TD2 = TypedDict("TD2", {"a": ReadOnly[str]}, total=True, readonly=True)
-TD3 = TypedDict("TD3", {"a": ReadOnly[str]}, readonly=False, total=True)
-
-# This should generate an error because readonly accepts only bool literals.
-TD4 = TypedDict("TD4", {"a": ReadOnly[str]}, total=True, readonly=1)
-
-# This should generate an error because TypedDict doesn't accept additional parameters.
-TD5 = TypedDict("TD5", {"a": ReadOnly[str]}, total=True, readonly=True, foo=1)
+TD2 = TypedDict("TD2", {"a": ReadOnly[str]}, total=True)
+TD3 = TypedDict("TD3", {"a": ReadOnly[str]}, total=True)
 
 
 class F1(TypedDict):
     a: Required[int]
-
-
-class F2(F1, readonly=True):
-    # This should generate an error because it is redefined as read-only.
-    a: int
+    b: ReadOnly[NotRequired[int]]
+    c: ReadOnly[Required[int]]
 
 
 class F3(F1):
     # This should generate an error because it is redefined as read-only.
     a: ReadOnly[int]
+
+
+class F4(F1):
+    # This should generate an error because it is redefined as not required.
+    a: NotRequired[int]
+
+
+class F5(F1):
+    b: ReadOnly[Required[int]]
+
+
+class F6(F1):
+    # This should generate an error because a "not required" field can't
+    # override a "required" field.
+    c: ReadOnly[NotRequired[int]]

@@ -2,7 +2,8 @@
 # are applied when all operands are literal types with the same associated
 # class.
 
-from typing import Literal
+from functools import reduce
+from typing import Iterable, Literal
 
 
 def func1(a: Literal[1, 2], b: Literal[0, 4], c: Literal[3, 4]):
@@ -123,3 +124,42 @@ def func6(x: Literal[1, 3, 5, 7, 11, 13]):
 
     y *= x
     reveal_type(y, expected_text="int")
+
+
+def func7(values: Iterable[str]) -> tuple[str, int]:
+    return reduce(
+        lambda x, value: (x[0] + value, x[1] + 1),
+        values,
+        ("", 0),
+    )
+
+
+def func8(values: Iterable[float]) -> float:
+    total, num_of_values = reduce(
+        lambda total_and_count, value: (
+            total_and_count[0] + value,
+            total_and_count[1] + 1,
+        ),
+        values,
+        (0, 0),
+    )
+    return total / num_of_values
+
+
+def func9(a: int) -> None:
+    b = 0
+    reveal_type(b, expected_text="Literal[0]")
+
+    def inner1() -> None:
+        nonlocal b
+        b += 1
+        reveal_type(b, expected_text="int")
+        b = b + 1
+
+    def inner2() -> None:
+        nonlocal b
+        b = b + 1
+        reveal_type(b, expected_text="int")
+
+    inner1()
+    inner2()
